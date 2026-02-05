@@ -1,32 +1,43 @@
-"""Streamlit 캐싱 유틸리티 — 샘플 데이터 캐시.
+"""Streamlit 캐싱 유틸리티.
 
-st.cache_data 를 함수 내부에서 적용하여,
-모듈 임포트 시점의 Streamlit 런타임 의존성을 제거한다.
+- OpenAPI 실시간 조회 결과: 5분 TTL 캐시
 """
 
 from __future__ import annotations
 
-from src.data.data_loader import load_sample_records
-from src.data.models import CapacityRecord
+from src.data.kepco_api import KepcoApiClient
+from src.data.models import AddressParams, CapacityRecord
 
 
-def get_cached_sample_records() -> list[CapacityRecord]:
-    """캐시된 샘플 데이터를 CapacityRecord 리스트로 반환.
+def fetch_capacity_cached(params: AddressParams) -> list[CapacityRecord]:
+    """한전 OpenAPI 호출 결과를 캐시하여 반환 (TTL 5분)."""
 
-    Streamlit 런타임이 존재하면 st.cache_data 를 활용하고,
-    런타임 외부(테스트/CLI)에서는 매번 새로 로드한다.
-    """
     try:
         import streamlit as st
 
-        @st.cache_data(show_spinner=False)
-        def _load() -> list[dict]:
-            records = load_sample_records()
+        @st.cache_data(ttl=300, show_spinner=False)
+        def _fetch(
+            metro_cd: str,
+            city_cd: str,
+            dong: str,
+            ri: str,
+            jibun: str,
+        ) -> list[dict]:
+            client = KepcoApiClient()
+            try:
+                records = client.fetch_capacity(
+                    AddressParams(metro_cd=metro_cd, city_cd=city_cd, dong=dong, ri=ri, jibun=jibun)
+                )
+            finally:
+                client.close()
             return [r.model_dump() for r in records]
 
-        raw = _load()
+        raw = _fetch(params.metro_cd, params.city_cd, params.dong, params.ri, params.jibun)
+        return [CapacityRecord(**d) for d in raw]
     except Exception:
-        # Streamlit 런타임 없이 실행되는 경우 (테스트, CLI 등)
-        raw = [r.model_dump() for r in load_sample_records()]
-
-    return [CapacityRecord(**d) for d in raw]
+        # Streamlit 런타임 외부(테스트/CLI)에서는 캐시 없이 실행
+        client = KepcoApiClient()
+        try:
+            return client.fetch_capacity(params)
+        finally:
+            client.close()
