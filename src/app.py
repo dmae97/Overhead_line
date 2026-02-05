@@ -213,7 +213,8 @@ def _render_query_sidebar() -> tuple[list[CapacityRecord] | None, str]:
                         f"- python={py}\n\n"
                         "해결:\n"
                         "1) 로컬: `uv sync` 후 `uv run streamlit run src/app.py`\n"
-                        "2) Streamlit Cloud: Selenium 폴백이 제한될 수 있어 KEPCO_API_KEY 설정을 권장합니다."
+                        "2) Streamlit Cloud: Selenium 폴백이 제한될 수 있어 "
+                        "KEPCO_API_KEY 설정을 권장합니다."
                     ) from exc
 
                 records = KepcoCapacityScraper().fetch_capacity_by_keyword(keyword)
@@ -301,7 +302,8 @@ def main() -> None:
             st.caption("KEPCO_API_KEY가 설정되어 있습니다. (OpenAPI 실시간 조회)")
         else:
             st.caption(
-                "KEPCO_API_KEY가 없으면 Selenium 폴백을 시도합니다. (서버 환경에서는 실패할 수 있음)"
+                "KEPCO_API_KEY가 없으면 Selenium 폴백을 시도합니다. "
+                "(서버 환경에서는 실패할 수 있음)"
             )
         return
 

@@ -47,7 +47,8 @@ class KepcoApiClient:
 
         if not self._api_key:
             raise KepcoAPIError(
-                "KEPCO_API_KEY가 설정되지 않았습니다. 환경변수(.env 포함) 또는 Streamlit Secrets에 KEPCO_API_KEY를 설정하세요.",
+                "KEPCO_API_KEY가 설정되지 않았습니다. "
+                "환경변수(.env 포함) 또는 Streamlit Secrets에 KEPCO_API_KEY를 설정하세요.",
                 status_code=None,
             )
 
