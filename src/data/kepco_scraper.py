@@ -110,6 +110,7 @@ class KepcoCapacityScraper:
     def _create_driver(self):
         from selenium import webdriver
         from selenium.common.exceptions import SessionNotCreatedException
+        from selenium.webdriver.chrome.service import Service
 
         opts = webdriver.ChromeOptions()
 
@@ -130,7 +131,7 @@ class KepcoCapacityScraper:
         opts.set_capability("goog:loggingPrefs", {"performance": "ALL"})
 
         # 브라우저 바이너리 체크 (환경 문제를 더 빨리 진단)
-        chrome_bin = (
+        chrome_bin = os.getenv("CHROME_BIN") or (
             shutil.which("google-chrome")
             or shutil.which("google-chrome-stable")
             or shutil.which("chromium")
@@ -139,10 +140,20 @@ class KepcoCapacityScraper:
         if not chrome_bin:
             raise ScraperError(
                 "Chrome/Chromium 실행 파일을 찾을 수 없습니다. "
-                "google-chrome 또는 chromium 설치가 필요합니다."
+                "google-chrome 또는 chromium 설치가 필요합니다.\n"
+                "- Streamlit Cloud: repo 루트에 packages.txt를 추가하고 `chromium`, "
+                "`chromium-driver`를 설치하세요.\n"
+                "- 대안: Secrets에 KEPCO_API_KEY를 설정해 OpenAPI 모드로 실행하세요."
             )
 
+        # chromedriver는 있으면 사용하고, 없으면 Selenium Manager에 맡긴다.
+        opts.binary_location = chrome_bin
+        driver_path = os.getenv("CHROMEDRIVER_PATH") or shutil.which("chromedriver")
+        service = Service(driver_path) if driver_path else None
+
         try:
+            if service is not None:
+                return webdriver.Chrome(service=service, options=opts)
             return webdriver.Chrome(options=opts)
         except SessionNotCreatedException as exc:
             display = os.getenv("DISPLAY")
