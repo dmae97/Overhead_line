@@ -1,0 +1,60 @@
+[project]
+name = "overhead-line-scanner"
+version = "0.2.0"
+description = "한전(KEPCO) 배전선로 여유용량 분석 대시보드 — API 키 불필요"
+requires-python = ">=3.11"
+readme = "README.md"
+
+dependencies = [
+    "streamlit>=1.30",
+    "PublicDataReader>=1.1",
+    "pandas>=2.0",
+    "plotly>=5.0",
+    "pydantic>=2.0",
+    "python-dotenv",
+    "openpyxl>=3.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov",
+    "ruff",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "N",   # pep8-naming
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "SIM", # flake8-simplify
+    "TCH", # flake8-type-checking
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["src"]
+
+[tool.pyright]
+reportMissingImports = "none"
+reportMissingTypeStubs = "none"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: 외부 의존성이 필요한 통합 테스트",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
