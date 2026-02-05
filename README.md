@@ -11,6 +11,15 @@ cp .env.example .env
 streamlit run src/app.py
 ```
 
+## Streamlit Cloud 배포
+
+- Streamlit Cloud에서는 `.env` 대신 **Secrets**를 사용하세요.
+- App settings → Secrets에 아래처럼 추가:
+
+```toml
+KEPCO_API_KEY = "your_40_char_api_key_here"
+```
+
 ## 기능
 
 - 시/도 → 시/군/구 → 읍/면/동 3단계 지역 선택

@@ -206,24 +206,14 @@ def _render_query_sidebar() -> tuple[list[CapacityRecord] | None, str]:
                     from src.data.kepco_scraper import KepcoCapacityScraper
                 except Exception as exc:
                     py = sys.executable
-                    is_venv = "/.venv/" in py.replace("\\", "/")
                     cause = f"{type(exc).__name__}: {exc}"
-                    hint = (
-                        "현재 Streamlit이 .venv 환경이 아닌 Python으로 실행 중일 가능성이 큽니다. "
-                        f"(python={py})"
-                        if not is_venv
-                        else f"python={py}"
-                    )
-
                     raise ScraperError(
                         "Selenium 폴백 모듈을 로드하지 못했습니다.\n"
                         f"- 원인: {cause}\n"
-                        f"- 힌트: {hint}\n\n"
-                        "해결 방법(택1):\n"
-                        "1) uv 사용(권장): `uv sync --extra dev` 후 "
-                        "`uv run streamlit run src/app.py`\n"
-                        "2) venv 직접 실행: `./.venv/bin/streamlit run src/app.py`\n"
-                        "3) (비권장) 현재 Python에 selenium 설치: `python -m pip install selenium`"
+                        f"- python={py}\n\n"
+                        "해결:\n"
+                        "1) 로컬: `uv sync` 후 `uv run streamlit run src/app.py`\n"
+                        "2) Streamlit Cloud: Selenium 폴백이 제한될 수 있어 KEPCO_API_KEY 설정을 권장합니다."
                     ) from exc
 
                 records = KepcoCapacityScraper().fetch_capacity_by_keyword(keyword)
@@ -301,16 +291,6 @@ def main() -> None:
     st.title("⚡ 한전 배전선로 여유용량 스캐너")
     st.caption("태양광 발전사업 계통연계 가능 여부를 빠르게 확인하세요.")
 
-    # 실행 환경 힌트 (Selenium 폴백 시 가장 흔한 원인: venv 밖에서 streamlit 실행)
-    if not settings.kepco_api_key:
-        py = sys.executable
-        if "/.venv/" not in py.replace("\\", "/"):
-            st.warning(
-                "현재 Python이 .venv가 아닙니다. Selenium 폴백이 동작하려면 "
-                "이 Python 환경에 selenium이 설치되어야 합니다. "
-                "권장 실행: `uv run streamlit run src/app.py`"
-            )
-
     _render_refresh_timer()
 
     records, data_label = _render_query_sidebar()
@@ -318,10 +298,10 @@ def main() -> None:
     if records is None:
         st.info("👈 사이드바에서 지역을 선택하고 '조회'를 누르세요.")
         if settings.kepco_api_key:
-            st.caption(".env에 KEPCO_API_KEY가 설정되어 있습니다. (OpenAPI 실시간 조회)")
+            st.caption("KEPCO_API_KEY가 설정되어 있습니다. (OpenAPI 실시간 조회)")
         else:
             st.caption(
-                "KEPCO_API_KEY가 없으면 Selenium 폴백으로 조회합니다. (브라우저가 열릴 수 있음)"
+                "KEPCO_API_KEY가 없으면 Selenium 폴백을 시도합니다. (서버 환경에서는 실패할 수 있음)"
             )
         return
 
