@@ -52,11 +52,19 @@ def get_sido_list() -> list[str]:
 
 
 def get_sigungu_list(sido_name: str) -> list[str]:
-    """선택한 시/도 내 시/군/구 목록 반환 (정렬)."""
+    """선택한 시/도 내 시/군/구 목록 반환 (정렬).
+
+    시군구가 없는 광역시/특별자치시(세종시 등)는 시도명을 반환한다.
+    """
     df = load_bdong_codes()
     filtered = df[df["시도명"] == sido_name]
     result = filtered["시군구명"].dropna().unique().tolist()
-    return sorted([s for s in result if s])
+    result = sorted([s for s in result if s])
+
+    # 시군구가 없으면 시도명을 시군구로 사용 (세종시 등)
+    if not result:
+        return [sido_name]
+    return result
 
 
 def get_dong_list(sido_name: str, sigungu_name: str) -> list[str]:
@@ -73,9 +81,19 @@ def to_kepco_params(region: RegionInfo) -> AddressParams:
     법정동코드 체계:
     - metroCd = 시도코드 앞 2자리
     - cityCd  = 시군구코드 뒤 3자리
+
+    시군구가 없는 광역시/특별자치시(세종시 등)는 시군구명이 비어있으므로
+    시도명만으로 매칭한다.
     """
     df = load_bdong_codes()
-    matched = df[(df["시도명"] == region.sido) & (df["시군구명"] == region.sigungu)]
+
+    # 시군구가 시도명과 같으면 (세종시 등) 시군구명이 빈 행을 찾음
+    if region.sido == region.sigungu:
+        matched = df[(df["시도명"] == region.sido) & (df["시군구명"] == "")]
+        # 36000 같은 시도 전체 코드 제외, 36110 같은 실제 행정구역만
+        matched = matched[matched["시군구코드"].astype(str).str.endswith("110")]
+    else:
+        matched = df[(df["시도명"] == region.sido) & (df["시군구명"] == region.sigungu)]
 
     if matched.empty:
         raise AddressDataError(
