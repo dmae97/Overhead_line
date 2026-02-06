@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import time
@@ -21,6 +22,8 @@ from typing import Any
 from src.core.config import settings
 from src.core.exceptions import ScraperError
 from src.data.models import CapacityRecord
+
+logger = logging.getLogger(__name__)
 
 
 def _extract_records(payload: Any) -> list[dict[str, Any]]:
@@ -70,7 +73,11 @@ class KepcoCapacityScraper:
             # document-start에 webdriver 플래그를 비활성화해 정상 페이지 로딩을 시도한다.
             self._apply_stealth(driver)
 
+            logger.info("📡 한전 접속가능 용량조회 페이지 로딩: %s", self._url)
             driver.get(self._url)
+
+            # 봇 탐지 리디렉트 감지
+            self._check_redirect(driver)
 
             self._enable_network(driver)
 
@@ -99,14 +106,7 @@ class KepcoCapacityScraper:
                 driver.quit()
 
     def _effective_headless(self) -> bool:
-        """실제 headless 동작 여부를 결정.
-
-        - SELENIUM_HEADLESS가 명시적으로 "false"인 경우에만 headless 해제.
-        - 미설정이거나 "true"이면 headless 모드 사용.
-        - WSL 환경에서 DISPLAY가 설정되어 있어도 X 서버가 비활성일 수 있으므로
-          명시적 false 외에는 headless를 기본으로 한다.
-        """
-
+        """실제 headless 동작 여부를 결정."""
         explicit = os.getenv("SELENIUM_HEADLESS")
         if explicit is not None:
             return explicit.strip().lower() != "false"
@@ -179,12 +179,7 @@ class KepcoCapacityScraper:
 
     @staticmethod
     def _apply_stealth(driver) -> None:
-        """document-start에 최소 스텔스 스크립트를 주입.
-
-        한전 사이트 일부 화면은 `navigator.webdriver` 기반으로 자동화를 감지해
-        임시 안내 페이지(/index.html)로 이동시키는 케이스가 확인됐다.
-        """
-
+        """document-start에 최소 스텔스 스크립트를 주입."""
         try:
             driver.execute_cdp_cmd(
                 "Page.addScriptToEvaluateOnNewDocument",
@@ -198,6 +193,23 @@ class KepcoCapacityScraper:
             return
 
     @staticmethod
+    def _check_redirect(driver) -> None:
+        """봇 탐지/유지보수 등에 의한 리디렉트를 감지."""
+        current_url = driver.current_url.lower()
+        redirect_indicators = ["/index.html", "/kepco/main/main.do"]
+        for indicator in redirect_indicators:
+            if indicator in current_url and "cohepp" not in current_url:
+                logger.warning(
+                    "⚠️ 봇 탐지/리디렉트 감지: 현재 URL=%s",
+                    driver.current_url,
+                )
+                raise ScraperError(
+                    f"봇 탐지로 인해 다른 페이지로 리디렉트되었습니다.\n"
+                    f"현재 URL: {driver.current_url}\n"
+                    f"잠시 후 다시 시도하거나, KEPCO_API_KEY를 설정해 OpenAPI를 사용하세요."
+                )
+
+    @staticmethod
     def _enable_network(driver) -> None:
         try:
             driver.execute_cdp_cmd("Network.enable", {})
@@ -207,28 +219,112 @@ class KepcoCapacityScraper:
 
     @staticmethod
     def _trigger_search(driver, keyword: str) -> None:
-        from selenium.common.exceptions import TimeoutException
+        """다중 셀렉터 + iframe 탐색으로 검색 입력창을 찾아 키워드를 입력."""
         from selenium.webdriver.common.by import By
         from selenium.webdriver.common.keys import Keys
         from selenium.webdriver.support import expected_conditions as ec
         from selenium.webdriver.support.ui import WebDriverWait
 
-        wait = WebDriverWait(driver, 20)
+        logger.info("🔍 검색 키워드: %s", keyword)
 
-        # 1) 입력창 찾기 (현재 HTML에서 확인된 id)
-        try:
-            inp = wait.until(ec.presence_of_element_located((By.ID, "inpSearchKeyword")))
-        except TimeoutException as exc:
-            raise ScraperError("검색 입력창(#inpSearchKeyword)을 찾을 수 없습니다.") from exc
+        # 사용할 셀렉터 목록 (우선순위 순)
+        input_selectors = [
+            (By.ID, "inpSearchKeyword"),
+            (By.NAME, "searchKeyword"),
+            (By.NAME, "keyword"),
+            (By.NAME, "addr"),
+            (By.CSS_SELECTOR, "input[placeholder*='주소']"),
+            (By.CSS_SELECTOR, "input[placeholder*='검색']"),
+            (By.CSS_SELECTOR, "input[type='text']"),
+        ]
+
+        wait = WebDriverWait(driver, 30)
+
+        # 1) 메인 프레임에서 탐색
+        inp = None
+        for by, value in input_selectors:
+            try:
+                inp = wait.until(
+                    ec.presence_of_element_located((by, value)),
+                )
+                if inp and inp.is_displayed():
+                    logger.info("✅ 입력창 발견 (메인 프레임): %s=%s", by, value)
+                    break
+                inp = None
+            except Exception:
+                inp = None
+                continue
+
+        # 2) iframe 안에서 탐색
+        if inp is None:
+            iframes = driver.find_elements(By.TAG_NAME, "iframe")
+            logger.info("🔍 iframe %d개 탐색 시작", len(iframes))
+            for iframe in iframes:
+                try:
+                    driver.switch_to.frame(iframe)
+                    iframe_wait = WebDriverWait(driver, 5)
+                    for by, value in input_selectors:
+                        try:
+                            inp = iframe_wait.until(
+                                ec.presence_of_element_located((by, value)),
+                            )
+                            if inp and inp.is_displayed():
+                                logger.info(
+                                    "✅ 입력창 발견 (iframe): %s=%s",
+                                    by,
+                                    value,
+                                )
+                                break
+                            inp = None
+                        except Exception:
+                            inp = None
+                            continue
+                    if inp:
+                        break
+                    driver.switch_to.default_content()
+                except Exception:
+                    with suppress(Exception):
+                        driver.switch_to.default_content()
+                    continue
+
+        if inp is None:
+            # 진단 정보 수집
+            page_title = ""
+            current_url = ""
+            with suppress(Exception):
+                driver.switch_to.default_content()
+                page_title = driver.title
+                current_url = driver.current_url
+            raise ScraperError(
+                f"검색 입력창을 찾을 수 없습니다.\n"
+                f"현재 URL: {current_url}\n"
+                f"페이지 제목: {page_title}\n"
+                f"페이지 구조가 변경되었거나 봇 감지로 차단되었을 수 있습니다."
+            )
 
         inp.clear()
         inp.send_keys(keyword)
 
-        # 2) 검색 트리거: 버튼 클릭 or Enter
-        try:
-            btn = driver.find_element(By.ID, "btn_search")
-            btn.click()
-        except Exception:
+        # 검색 트리거: 버튼 클릭 or Enter
+        search_triggered = False
+        button_selectors = [
+            (By.ID, "btn_search"),
+            (By.CSS_SELECTOR, "button[type='submit']"),
+            (By.CSS_SELECTOR, "input[type='submit']"),
+        ]
+        for by, value in button_selectors:
+            try:
+                btn = driver.find_element(by, value)
+                if btn.is_displayed():
+                    btn.click()
+                    search_triggered = True
+                    logger.info("✅ 검색 버튼 클릭: %s=%s", by, value)
+                    break
+            except Exception:
+                continue
+
+        if not search_triggered:
+            logger.info("검색 버튼 미발견 → Enter 키로 검색 트리거")
             inp.send_keys(Keys.ENTER)
 
     def _wait_for_capacity_payload(self, driver) -> Any:

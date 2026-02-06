@@ -8,11 +8,13 @@ API 키가 없을 때 한전ON 접속가능 용량조회를 브라우저 자동�
 설정:
   - SCRAPER_ENGINE 환경변수로 1차 엔진 지정 (기본 "playwright")
   - 1차 엔진 실패 시 자동으로 나머지 엔진을 폴백 시도
+  - 각 엔진은 최대 MAX_RETRIES회 재시도 (봇 탐지 등 일시적 실패 대응)
 """
 
 from __future__ import annotations
 
 import logging
+import time
 from typing import Literal
 
 from src.core.config import settings
@@ -22,6 +24,11 @@ from src.data.models import CapacityRecord
 logger = logging.getLogger(__name__)
 
 EngineType = Literal["playwright", "selenium"]
+
+# 엔진당 최대 재시도 횟수 (첫 시도 포함)
+MAX_RETRIES = 2
+# 재시도 사이 대기 시간 (초)
+RETRY_DELAY_SECONDS = 3.0
 
 # 엔진별 지연 import + 실행을 담당하는 내부 함수
 # (각 패키지가 미설치여도 import 시점에 앱이 죽지 않도록 lazy import)
@@ -67,8 +74,78 @@ def _get_runner(engine_name: EngineType):
     return _run_playwright
 
 
+def _run_engine_with_retry(
+    engine_name: EngineType,
+    keyword: str,
+) -> list[CapacityRecord]:
+    """단일 엔진을 최대 MAX_RETRIES회 재시도하며 실행.
+
+    첫 시도 실패 시 RETRY_DELAY_SECONDS만큼 대기 후 재시도한다.
+    ImportError 등 설치 문제는 재시도 의미가 없으므로 즉시 포기.
+    """
+    runner = _get_runner(engine_name)
+    last_exc: Exception | None = None
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            logger.info(
+                "🚀 [%s] 엔진 시도 %d/%d: %s",
+                engine_name,
+                attempt,
+                MAX_RETRIES,
+                keyword,
+            )
+            records = runner(keyword)
+            logger.info(
+                "✅ [%s] 엔진 조회 성공 — %d건 반환",
+                engine_name,
+                len(records),
+            )
+            return records
+        except ScraperError as exc:
+            last_exc = exc
+            # 설치 문제(Import 관련)는 재시도 무의미
+            if "설치" in exc.message or "import" in exc.message.lower():
+                logger.warning(
+                    "⚠️ [%s] 설치 문제로 즉시 포기: %s",
+                    engine_name,
+                    exc.message[:200],
+                )
+                break
+            logger.warning(
+                "⚠️ [%s] 시도 %d 실패: %s",
+                engine_name,
+                attempt,
+                exc.message[:200],
+            )
+        except Exception as exc:
+            last_exc = exc
+            logger.warning(
+                "⚠️ [%s] 시도 %d 예외: %s: %s",
+                engine_name,
+                attempt,
+                type(exc).__name__,
+                str(exc)[:200],
+            )
+
+        # 재시도 전 대기 (마지막 시도 후에는 불필요)
+        if attempt < MAX_RETRIES:
+            logger.info(
+                "⏳ [%s] %.1f초 후 재시도...",
+                engine_name,
+                RETRY_DELAY_SECONDS,
+            )
+            time.sleep(RETRY_DELAY_SECONDS)
+
+    # 모든 재시도 소진
+    assert last_exc is not None
+    raise last_exc
+
+
 def fetch_capacity_by_browser(keyword: str) -> list[CapacityRecord]:
     """Playwright 우선 → Selenium 폴백으로 용량 조회를 시도.
+
+    각 엔진은 내부적으로 최대 MAX_RETRIES회 재시도한다.
 
     Args:
         keyword: 검색할 주소 키워드 (예: "세종특별자치시 조치원읍 142-1")
@@ -83,30 +160,11 @@ def fetch_capacity_by_browser(keyword: str) -> list[CapacityRecord]:
     errors: list[tuple[str, Exception]] = []
 
     for engine_name in engines:
-        runner = _get_runner(engine_name)
         try:
-            logger.info("🚀 [%s] 엔진으로 브라우저 조회 시작: %s", engine_name, keyword)
-            records = runner(keyword)
-            logger.info(
-                "✅ [%s] 엔진 조회 성공 — %d건 반환",
-                engine_name,
-                len(records),
-            )
-            return records
+            return _run_engine_with_retry(engine_name, keyword)
         except ScraperError as exc:
-            logger.warning(
-                "⚠️ [%s] 엔진 실패: %s",
-                engine_name,
-                exc.message,
-            )
             errors.append((engine_name, exc))
         except Exception as exc:
-            logger.warning(
-                "⚠️ [%s] 엔진 예외: %s: %s",
-                engine_name,
-                type(exc).__name__,
-                exc,
-            )
             errors.append((engine_name, exc))
 
     # 모든 엔진이 실패한 경우 — 에러 요약 메시지 생성

@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
+import subprocess
 import threading
 from dataclasses import dataclass, field
 from typing import Any
@@ -42,6 +44,64 @@ def _extract_records(payload: Any) -> list[dict[str, Any]]:
 def _looks_like_capacity_payload(text: str) -> bool:
     """빠른 힌트: 응답에 vol1/vol2/vol3가 포함되면 용량 응답일 확률이 높다."""
     return '"vol1"' in text and '"vol2"' in text and '"vol3"' in text
+
+
+def _find_system_chromium() -> str | None:
+    """시스템에 설치된 Chromium/Chrome 바이너리 경로를 찾는다."""
+    candidates = [
+        "chromium",
+        "chromium-browser",
+        "google-chrome",
+        "google-chrome-stable",
+    ]
+    for name in candidates:
+        path = shutil.which(name)
+        if path:
+            return path
+    return None
+
+
+def _ensure_playwright_browsers() -> None:
+    """Playwright 브라우저 바이너리가 없으면 자동 설치를 시도한다.
+
+    Streamlit Cloud 등 빌드 단계에서 `playwright install`이 누락된
+    환경을 자동으로 복구한다. 실패해도 예외를 던지지 않는다
+    (이후 launch에서 시스템 chromium 폴백 시도).
+    """
+    try:
+        # 빠른 체크: chromium 실행파일이 이미 있는지 확인
+        result = subprocess.run(
+            ["python", "-m", "playwright", "install", "--dry-run", "chromium"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        # dry-run이 지원 안 되는 버전도 있음 — 무시하고 진행
+    except Exception:
+        pass
+
+    logger.info("📦 Playwright chromium 브라우저 자동 설치 시도...")
+    try:
+        proc = subprocess.run(
+            ["python", "-m", "playwright", "install", "chromium"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if proc.returncode == 0:
+            logger.info("✅ Playwright chromium 설치 완료")
+        else:
+            logger.warning(
+                "⚠️ Playwright chromium 설치 실패 (rc=%d): %s",
+                proc.returncode,
+                (proc.stderr or proc.stdout)[:300],
+            )
+    except subprocess.TimeoutExpired:
+        logger.warning("⚠️ Playwright chromium 설치 타임아웃 (120s)")
+    except FileNotFoundError:
+        logger.warning("⚠️ python 실행파일을 찾을 수 없어 Playwright 자동설치 불가")
+    except Exception as exc:
+        logger.warning("⚠️ Playwright 자동설치 중 예외: %s", exc)
 
 
 @dataclass(frozen=True)
@@ -105,8 +165,6 @@ class KepcoPlaywrightScraper:
         def _on_response(response):
             """Network 응답 이벤트 핸들러 — vol1/vol2/vol3 포함 JSON 탐지."""
             try:
-                content_type = response.headers.get("content-type", "")
-                # JSON 응답 또는 text/html(일부 한전 응답)을 대상으로
                 if response.status != 200:
                     return
 
@@ -134,7 +192,6 @@ class KepcoPlaywrightScraper:
                 context = browser.new_context(
                     viewport={"width": 1400, "height": 900},
                     locale="ko-KR",
-                    # navigator.webdriver 우회를 위한 스텔스
                     extra_http_headers={
                         "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
                     },
@@ -163,7 +220,10 @@ class KepcoPlaywrightScraper:
 
                 logger.info("📡 한전 접속가능 용량조회 페이지 로딩: %s", self._url)
                 page.goto(self._url, wait_until="domcontentloaded")
-                logger.info("✅ 페이지 로드 완료")
+                logger.info("✅ 페이지 로드 완료 (현재 URL: %s)", page.url)
+
+                # 봇 탐지 리디렉트 감지
+                self._check_redirect(page)
 
                 # 검색 실행
                 self._trigger_search(page, keyword)
@@ -209,7 +269,13 @@ class KepcoPlaywrightScraper:
                         pass
 
     def _launch_browser(self, pw):
-        """Playwright 브라우저 인스턴스 실행."""
+        """Playwright 브라우저 인스턴스 실행.
+
+        시도 순서:
+        1) Playwright 관리 바이너리로 launch
+        2) 실패 시 자동 설치 후 재시도
+        3) 그래도 실패 시 시스템 chromium executable_path 폴백
+        """
         browser_type_name = self._options.browser_type.lower()
 
         if browser_type_name == "firefox":
@@ -219,57 +285,109 @@ class KepcoPlaywrightScraper:
         else:
             launcher = pw.chromium
 
+        launch_args = (
+            [
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+            ]
+            if browser_type_name == "chromium"
+            else []
+        )
+
         logger.info(
             "🚀 Playwright %s 브라우저 시작 (headless=%s)",
             browser_type_name,
             self._options.headless,
         )
 
-        return launcher.launch(
-            headless=self._options.headless,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
-            ]
-            if browser_type_name == "chromium"
-            else [],
+        # 1차 시도: Playwright 관리 바이너리
+        try:
+            return launcher.launch(
+                headless=self._options.headless,
+                args=launch_args,
+            )
+        except Exception as first_err:
+            logger.warning(
+                "⚠️ Playwright 관리 바이너리 실행 실패: %s — 자동 설치 시도",
+                str(first_err)[:200],
+            )
+
+        # 2차 시도: 브라우저 자동 설치 후 재시도
+        _ensure_playwright_browsers()
+        try:
+            return launcher.launch(
+                headless=self._options.headless,
+                args=launch_args,
+            )
+        except Exception as second_err:
+            logger.warning(
+                "⚠️ 자동설치 후에도 실패: %s — 시스템 chromium 폴백 시도",
+                str(second_err)[:200],
+            )
+
+        # 3차 시도: 시스템에 설치된 chromium/chrome 바이너리 사용
+        system_chromium = _find_system_chromium()
+        if system_chromium and browser_type_name == "chromium":
+            logger.info(
+                "🔄 시스템 Chromium 사용: %s",
+                system_chromium,
+            )
+            try:
+                return launcher.launch(
+                    headless=self._options.headless,
+                    executable_path=system_chromium,
+                    args=launch_args,
+                )
+            except Exception as third_err:
+                raise ScraperError(
+                    f"Playwright 브라우저 실행 실패 (3단계 모두 실패).\n"
+                    f"시스템 chromium ({system_chromium})도 사용 불가: {third_err}"
+                ) from third_err
+
+        raise ScraperError(
+            "Playwright 브라우저 실행 실패.\n"
+            "해결: `playwright install chromium` 실행 또는 "
+            "시스템에 chromium을 설치하세요 (packages.txt에 chromium 추가)."
         )
+
+    @staticmethod
+    def _check_redirect(page) -> None:
+        """봇 탐지/유지보수 등에 의한 리디렉트를 감지."""
+        current_url = page.url.lower()
+        # 한전 사이트가 /index.html 또는 메인으로 리디렉트하는 경우
+        redirect_indicators = ["/index.html", "/kepco/main/main.do"]
+        for indicator in redirect_indicators:
+            if indicator in current_url and "COHEPP" not in page.url:
+                logger.warning(
+                    "⚠️ 봇 탐지/리디렉트 감지: 현재 URL=%s (예상: COHEPP 페이지)",
+                    page.url,
+                )
+                raise ScraperError(
+                    f"봇 탐지로 인해 다른 페이지로 리디렉트되었습니다.\n"
+                    f"현재 URL: {page.url}\n"
+                    f"잠시 후 다시 시도하거나, KEPCO_API_KEY를 설정해 OpenAPI를 사용하세요."
+                )
 
     def _trigger_search(self, page, keyword: str) -> None:
         """검색 입력창에 키워드를 입력하고 검색을 트리거."""
         logger.info("🔍 검색 키워드: %s", keyword)
 
-        # 입력창 대기 및 입력
         try:
-            # 한전 접속가능 용량조회 페이지의 검색 입력창
-            # 여러 가능한 셀렉터를 순서대로 시도
-            input_selectors = [
-                "#inpSearchKeyword",
-                "input[name='searchKeyword']",
-                "input[type='text']",
-            ]
-
-            input_elem = None
-            for selector in input_selectors:
-                try:
-                    input_elem = page.wait_for_selector(
-                        selector,
-                        timeout=10000,
-                        state="visible",
-                    )
-                    if input_elem:
-                        logger.info("✅ 입력창 발견: %s", selector)
-                        break
-                except Exception:
-                    continue
+            # iframe 안에 폼이 있을 수 있으므로 먼저 iframe 탐지
+            input_elem = self._find_input_with_iframe_fallback(page)
 
             if not input_elem:
-                # 페이지 스크린샷으로 디버깅 힌트 제공
-                logger.warning("검색 입력창을 찾지 못함. 현재 URL: %s", page.url)
+                logger.warning(
+                    "검색 입력창을 찾지 못함. 현재 URL: %s, 제목: %s",
+                    page.url,
+                    page.title(),
+                )
                 raise ScraperError(
-                    "검색 입력창을 찾을 수 없습니다. "
-                    "페이지 구조가 변경되었거나 봇 감지로 차단되었을 수 있습니다."
+                    f"검색 입력창을 찾을 수 없습니다.\n"
+                    f"현재 URL: {page.url}\n"
+                    f"페이지 제목: {page.title()}\n"
+                    f"페이지 구조가 변경되었거나 봇 감지로 차단되었을 수 있습니다."
                 )
 
             # 기존 텍스트 제거 후 키워드 입력
@@ -285,6 +403,8 @@ class KepcoPlaywrightScraper:
                 "button:has-text('검색')",
                 "a:has-text('검색')",
                 ".btn_search",
+                "input[type='submit']",
+                "img[alt*='검색']",
             ]
 
             for selector in button_selectors:
@@ -307,6 +427,58 @@ class KepcoPlaywrightScraper:
             raise
         except Exception as exc:
             raise ScraperError(f"검색 트리거 실패: {exc}") from exc
+
+    @staticmethod
+    def _find_input_with_iframe_fallback(page):
+        """메인 페이지 → iframe 순서로 검색 입력창을 탐색."""
+        input_selectors = [
+            "#inpSearchKeyword",
+            "input[name='searchKeyword']",
+            "input[name='keyword']",
+            "input[name='addr']",
+            "input[placeholder*='주소']",
+            "input[placeholder*='검색']",
+            "input[type='text']",
+        ]
+
+        # 1) 메인 프레임에서 탐색
+        for selector in input_selectors:
+            try:
+                elem = page.wait_for_selector(
+                    selector,
+                    timeout=5000,
+                    state="visible",
+                )
+                if elem:
+                    logger.info("✅ 입력창 발견 (메인 프레임): %s", selector)
+                    return elem
+            except Exception:
+                continue
+
+        # 2) iframe 안에서 탐색
+        frames = page.frames
+        for frame in frames:
+            if frame == page.main_frame:
+                continue
+            logger.info("🔍 iframe 탐색: %s", frame.url[:80] if frame.url else "(빈 URL)")
+            for selector in input_selectors:
+                try:
+                    elem = frame.wait_for_selector(
+                        selector,
+                        timeout=3000,
+                        state="visible",
+                    )
+                    if elem:
+                        logger.info(
+                            "✅ 입력창 발견 (iframe: %s): %s",
+                            frame.url[:60] if frame.url else "?",
+                            selector,
+                        )
+                        return elem
+                except Exception:
+                    continue
+
+        return None
 
     def _wait_for_capacity_payload(
         self,
