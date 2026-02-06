@@ -44,7 +44,7 @@ class KepcoAPIError(OverheadLineError):
 
 
 class ScraperError(OverheadLineError):
-    """Selenium 기반 웹 조회 에러."""
+    """브라우저 자동화(Playwright/Selenium) 기반 웹 조회 에러."""
 
     def __init__(self, message: str = "웹 조회(스크래핑) 중 오류가 발생했습니다.") -> None:
         super().__init__(message)

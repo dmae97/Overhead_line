@@ -19,6 +19,7 @@ from src.data.address import to_kepco_params
 from src.data.data_loader import load_records_from_uploaded_file
 from src.data.history_db import HistoryRepository
 from src.data.models import CapacityRecord, QueryHistoryRecord, RegionInfo
+from src.data.scraper_service import fetch_capacity_by_browser
 from src.ui.charts import render_capacity_bar_chart, render_capacity_breakdown_chart
 from src.ui.dashboard import render_history_panel, render_result_table
 from src.ui.group_view import render_substation_group_view
@@ -175,7 +176,7 @@ def _render_query_sidebar() -> tuple[list[CapacityRecord] | None, str]:
         if jibun:
             params = params.model_copy(update={"jibun": jibun})
 
-        mode = "api" if settings.kepco_api_key else "selenium"
+        mode = "api" if settings.kepco_api_key else "browser"
         cache_key = _make_cache_key(mode, region, jibun)
         cache = _get_session_cache()
         cached_item = cache.get(cache_key)
@@ -200,24 +201,9 @@ def _render_query_sidebar() -> tuple[list[CapacityRecord] | None, str]:
             if settings.kepco_api_key:
                 records = fetch_capacity_cached(params)
             else:
-                # Selenium 폴백: 주소 키워드 기반 (브라우저 자동화)
+                # 브라우저 자동화 폴백: Playwright 우선 → Selenium 폴백
                 keyword = f"{region.display_name} {jibun}".strip()
-                try:
-                    from src.data.kepco_scraper import KepcoCapacityScraper
-                except Exception as exc:
-                    py = sys.executable
-                    cause = f"{type(exc).__name__}: {exc}"
-                    raise ScraperError(
-                        "Selenium 폴백 모듈을 로드하지 못했습니다.\n"
-                        f"- 원인: {cause}\n"
-                        f"- python={py}\n\n"
-                        "해결:\n"
-                        "1) 로컬: `uv sync` 후 `uv run streamlit run src/app.py`\n"
-                        "2) Streamlit Cloud: Selenium 폴백이 제한될 수 있어 "
-                        "KEPCO_API_KEY 설정을 권장합니다."
-                    ) from exc
-
-                records = KepcoCapacityScraper().fetch_capacity_by_keyword(keyword)
+                records = fetch_capacity_by_browser(keyword)
 
         cache[cache_key] = {
             "ts": now,
@@ -254,13 +240,13 @@ def _render_query_sidebar() -> tuple[list[CapacityRecord] | None, str]:
     except ScraperError as exc:
         st.sidebar.error(f"웹 조회 오류: {exc.message}")
         st.sidebar.caption(
-            "API 키가 없으면 브라우저 자동화로 조회합니다. "
+            "API 키가 없으면 Playwright → Selenium 순서로 브라우저 자동화를 시도합니다. "
             "CAPTCHA/로그인 요구 등으로 실패할 수 있습니다."
         )
 
         # 이전 성공 데이터가 있으면 유지
         cache = _get_session_cache()
-        mode = "selenium"
+        mode = "browser"
         cache_key = _make_cache_key(mode, region, jibun)
         cached_item = cache.get(cache_key)
         if isinstance(cached_item, dict) and cached_item.get("records"):
@@ -301,9 +287,10 @@ def main() -> None:
         if settings.kepco_api_key:
             st.caption("KEPCO_API_KEY가 설정되어 있습니다. (OpenAPI 실시간 조회)")
         else:
+            engine = settings.scraper_engine
             st.caption(
-                "KEPCO_API_KEY가 없으면 Selenium 폴백을 시도합니다. "
-                "(서버 환경에서는 실패할 수 있음)"
+                f"KEPCO_API_KEY가 없으면 브라우저 자동화로 조회합니다. "
+                f"(1차: {engine}, 폴백: {'selenium' if engine == 'playwright' else 'playwright'})"
             )
         return
 

@@ -131,6 +131,22 @@ class Settings:
         default_factory=lambda: _get_float("SELENIUM_RESULT_TIMEOUT_SECONDS", 30.0)
     )
 
+    # Playwright 설정 (Selenium 대체 — 더 안정적이고 경량)
+    playwright_headless: bool = field(
+        default_factory=lambda: _get_bool_default_true("PLAYWRIGHT_HEADLESS")
+    )
+    playwright_page_load_timeout_seconds: float = field(
+        default_factory=lambda: _get_float("PLAYWRIGHT_PAGE_LOAD_TIMEOUT_SECONDS", 40.0)
+    )
+    playwright_result_timeout_seconds: float = field(
+        default_factory=lambda: _get_float("PLAYWRIGHT_RESULT_TIMEOUT_SECONDS", 30.0)
+    )
+    playwright_browser_type: str = field(
+        default_factory=lambda: _get_str("PLAYWRIGHT_BROWSER_TYPE", "chromium")
+    )
+    # 스크래퍼 엔진 우선순위: "playwright" (기본) 또는 "selenium"
+    scraper_engine: str = field(default_factory=lambda: _get_str("SCRAPER_ENGINE", "playwright"))
+
     capacity_threshold_green: int = 3000
     capacity_threshold_yellow: int = 1000
     capacity_threshold_orange: int = 1

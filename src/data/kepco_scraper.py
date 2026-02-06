@@ -64,6 +64,12 @@ class KepcoCapacityScraper:
         driver = self._create_driver()
         try:
             driver.set_page_load_timeout(self._options.page_load_timeout_seconds)
+
+            # 일부 한전 페이지는 Selenium/Headless 환경을 감지하면 임시 안내 페이지로
+            # 강제 이동시키는 경우가 있다. (index.html)
+            # document-start에 webdriver 플래그를 비활성화해 정상 페이지 로딩을 시도한다.
+            self._apply_stealth(driver)
+
             driver.get(self._url)
 
             self._enable_network(driver)
@@ -119,6 +125,11 @@ class KepcoCapacityScraper:
             # Chrome 109+ 권장 headless 모드
             opts.add_argument("--headless=new")
 
+        # 자동화 감지 완화 (사이트에 따라 headless/selenium 감지 시 임시 페이지로 이동)
+        opts.add_argument("--disable-blink-features=AutomationControlled")
+        opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+        opts.add_experimental_option("useAutomationExtension", False)
+
         opts.add_argument("--no-sandbox")
         opts.add_argument("--disable-dev-shm-usage")
         opts.add_argument("--disable-gpu")
@@ -165,6 +176,26 @@ class KepcoCapacityScraper:
                 "해결: .env에 `SELENIUM_HEADLESS=true`를 설정하거나 "
                 "GUI 환경(WSLg 등)에서 실행하세요."
             ) from exc
+
+    @staticmethod
+    def _apply_stealth(driver) -> None:
+        """document-start에 최소 스텔스 스크립트를 주입.
+
+        한전 사이트 일부 화면은 `navigator.webdriver` 기반으로 자동화를 감지해
+        임시 안내 페이지(/index.html)로 이동시키는 케이스가 확인됐다.
+        """
+
+        try:
+            driver.execute_cdp_cmd(
+                "Page.addScriptToEvaluateOnNewDocument",
+                {
+                    "source": (
+                        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+                    )
+                },
+            )
+        except Exception:
+            return
 
     @staticmethod
     def _enable_network(driver) -> None:
