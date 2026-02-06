@@ -89,7 +89,6 @@ class TestParseResults:
         # mock page 객체
         mock_page = MagicMock()
         mock_page.evaluate.return_value = {
-            "_visible": True,
             "subst_nm": "사이변전소",
             "mtr_no": "#2",
             "dl_nm": "불당1",
@@ -128,19 +127,10 @@ class TestParseResults:
         assert r.dl_capacity == 13000
         assert r.is_connectable is True
 
-    def test_parse_not_visible(self) -> None:
-        """결과 프레임이 표시되지 않은 경우."""
-        mock_page = MagicMock()
-        mock_page.evaluate.return_value = {"_visible": False}
-
-        records = KepcoOnlineScraper._parse_results(mock_page)
-        assert records == []
-
     def test_parse_empty_data(self) -> None:
-        """결과 데이터가 비어있는 경우."""
+        """결과 데이터가 비어있는 경우 (DOM에 빈 텍스트)."""
         mock_page = MagicMock()
         mock_page.evaluate.return_value = {
-            "_visible": True,
             "subst_nm": "",
             "dl_nm": "",
         }

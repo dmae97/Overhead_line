@@ -404,21 +404,21 @@ class KepcoOnlineScraper:
         logger.info("🔍 검색 버튼 클릭")
         search_btn.click()
 
-        # 결과 프레임이 visible이 될 때까지 대기
+        # 결과 데이터가 DOM에 채워질 때까지 대기
+        # 참고: wframe01은 display:none 상태일 수 있지만 데이터는 DOM에 주입됨
         try:
             page.wait_for_function(
                 f"""() => {{
-                    const el = document.getElementById('{_RESULT_FRAME_ID}');
-                    return el && el.style.display !== 'none' && el.offsetParent !== null;
+                    const el = document.getElementById('{_RESULT_IDS["dl_nm"]}');
+                    return el && el.textContent.trim().length > 0;
                 }}""",
                 timeout=int(_SEARCH_WAIT_SECONDS * 1000),
             )
-            logger.info("✅ 결과 프레임 표시됨")
+            logger.info("✅ 결과 데이터 로드 감지됨")
         except Exception:
-            logger.warning("⏰ 결과 프레임 대기 시간 초과 (%.0fs)", _SEARCH_WAIT_SECONDS)
-            # 타임아웃이어도 DOM 파싱 시도 (데이터는 있을 수 있음)
+            logger.warning("⏰ 결과 데이터 대기 시간 초과 (%.0fs)", _SEARCH_WAIT_SECONDS)
 
-        # 추가 대기 (데이터 렌더링)
+        # 추가 대기 (데이터 렌더링 완료)
         time.sleep(2)
 
     @staticmethod
@@ -434,22 +434,12 @@ class KepcoOnlineScraper:
                 result[key] = el ? el.textContent.trim() : '';
             }
             
-            // 결과 프레임 표시 여부
-            const frame = document.getElementById('%s');
-            result['_visible'] = frame ? (frame.style.display !== 'none') : false;
-            
             return result;
         }"""
-            % (
-                str({k: v for k, v in _RESULT_IDS.items()}).replace("'", '"'),
-                _RESULT_FRAME_ID,
-            )
+            % str({k: v for k, v in _RESULT_IDS.items()}).replace("'", '"')
         )
 
-        if not raw.get("_visible"):
-            logger.warning("결과 프레임이 표시되지 않았습니다.")
-            return []
-
+        # 참고: wframe01이 display:none이더라도 데이터는 DOM에 주입됨
         subst_nm = raw.get("subst_nm", "")
         mtr_no = raw.get("mtr_no", "")
         dl_nm = raw.get("dl_nm", "")
