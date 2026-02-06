@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import logging
-import sys
 import time
 from datetime import datetime
 
@@ -14,12 +13,11 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from src.core.config import settings
-from src.core.exceptions import KepcoAPIError, ScraperError
+from src.core.exceptions import KepcoAPIError
 from src.data.address import to_kepco_params
 from src.data.data_loader import load_records_from_uploaded_file
 from src.data.history_db import HistoryRepository
 from src.data.models import CapacityRecord, QueryHistoryRecord, RegionInfo
-from src.data.scraper_service import fetch_capacity_by_browser
 from src.ui.charts import render_capacity_bar_chart, render_capacity_breakdown_chart
 from src.ui.dashboard import render_history_panel, render_result_table
 from src.ui.group_view import render_substation_group_view
@@ -171,12 +169,34 @@ def _render_query_sidebar() -> tuple[list[CapacityRecord] | None, str]:
         st.sidebar.warning("지역을 먼저 선택하세요.")
         return None, ""
 
+    # API 키가 없으면 조회 불가 — 안내 표시
+    if not settings.kepco_api_key:
+        st.sidebar.error("⚠️ KEPCO_API_KEY가 설정되지 않았습니다.")
+        st.sidebar.markdown(
+            "**무료 API 키 발급 방법:**\n"
+            "1. [한전 전력데이터 개방포털](https://bigdata.kepco.co.kr) 접속\n"
+            "2. 회원가입 후 로그인\n"
+            "3. 마이페이지 → API 인증키 발급\n"
+            "4. Streamlit Secrets 또는 `.env` 파일에 설정:\n"
+            "```\nKEPCO_API_KEY=발급받은키\n```"
+        )
+        st.sidebar.info("💡 API 키를 설정하면 실시간 여유용량 조회가 가능합니다.")
+
+        # 샘플 데이터로 대시보드 미리보기 제공
+        from src.data.data_loader import load_sample_records
+
+        sample = load_sample_records()
+        if sample:
+            st.sidebar.success(f"📦 샘플 데이터 {len(sample)}건을 표시합니다.")
+            return sample, "샘플 데이터 (데모)"
+        return None, ""
+
     try:
         params = to_kepco_params(region)
         if jibun:
             params = params.model_copy(update={"jibun": jibun})
 
-        mode = "api" if settings.kepco_api_key else "browser"
+        mode = "api"
         cache_key = _make_cache_key(mode, region, jibun)
         cache = _get_session_cache()
         cached_item = cache.get(cache_key)
@@ -198,12 +218,7 @@ def _render_query_sidebar() -> tuple[list[CapacityRecord] | None, str]:
                 return recs, str(label or region.display_name)
 
         with st.spinner(f"{region.display_name} 여유용량 조회 중..."):
-            if settings.kepco_api_key:
-                records = fetch_capacity_cached(params)
-            else:
-                # 브라우저 자동화 폴백: Playwright 우선 → Selenium 폴백
-                keyword = f"{region.display_name} {jibun}".strip()
-                records = fetch_capacity_by_browser(keyword)
+            records = fetch_capacity_cached(params)
 
         cache[cache_key] = {
             "ts": now,
@@ -222,32 +237,7 @@ def _render_query_sidebar() -> tuple[list[CapacityRecord] | None, str]:
 
         # 이전 성공 데이터가 있으면 유지
         cache = _get_session_cache()
-        mode = "api"
-        cache_key = _make_cache_key(mode, region, jibun)
-        cached_item = cache.get(cache_key)
-        if isinstance(cached_item, dict) and cached_item.get("records"):
-            st.sidebar.warning("마지막 성공 데이터로 표시합니다.")
-            ts = cached_item.get("ts")
-            if isinstance(ts, (int, float)):
-                st.session_state["_timer_state"] = {
-                    "last_ts": float(ts),
-                    "next_ts": float(ts) + min_interval_seconds,
-                    "label": str(cached_item.get("label") or region.display_name),
-                    "auto_reload": auto_reload,
-                }
-            return cached_item["records"], str(cached_item.get("label") or region.display_name)
-        return None, ""
-    except ScraperError as exc:
-        st.sidebar.error(f"웹 조회 오류: {exc.message}")
-        st.sidebar.caption(
-            "API 키가 없으면 Playwright → Selenium 순서로 브라우저 자동화를 시도합니다. "
-            "CAPTCHA/로그인 요구 등으로 실패할 수 있습니다."
-        )
-
-        # 이전 성공 데이터가 있으면 유지
-        cache = _get_session_cache()
-        mode = "browser"
-        cache_key = _make_cache_key(mode, region, jibun)
+        cache_key = _make_cache_key("api", region, jibun)
         cached_item = cache.get(cache_key)
         if isinstance(cached_item, dict) and cached_item.get("records"):
             st.sidebar.warning("마지막 성공 데이터로 표시합니다.")
@@ -285,12 +275,14 @@ def main() -> None:
     if records is None:
         st.info("👈 사이드바에서 지역을 선택하고 '조회'를 누르세요.")
         if settings.kepco_api_key:
-            st.caption("KEPCO_API_KEY가 설정되어 있습니다. (OpenAPI 실시간 조회)")
+            st.caption("✅ KEPCO_API_KEY가 설정되어 있습니다. (OpenAPI 실시간 조회)")
         else:
-            engine = settings.scraper_engine
-            st.caption(
-                f"KEPCO_API_KEY가 없으면 브라우저 자동화로 조회합니다. "
-                f"(1차: {engine}, 폴백: {'selenium' if engine == 'playwright' else 'playwright'})"
+            st.warning(
+                "⚠️ **KEPCO_API_KEY가 설정되지 않았습니다.**\n\n"
+                "실시간 조회를 위해 [한전 전력데이터 개방포털](https://bigdata.kepco.co.kr)에서 "
+                "무료 API 키를 발급받아 설정해주세요.\n\n"
+                "API 키 설정 방법: Streamlit Cloud → Settings → Secrets에 "
+                '`KEPCO_API_KEY = "발급받은키"` 추가'
             )
         return
 
