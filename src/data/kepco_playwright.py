@@ -10,10 +10,12 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from src.core.exceptions import ScraperError
-from src.data.models import CapacityRecord
+
+if TYPE_CHECKING:
+    from src.data.models import CapacityRecord
 
 logger = logging.getLogger(__name__)
 
@@ -29,9 +31,12 @@ def _parse_keyword_to_region(keyword: str) -> dict[str, str]:
     """키워드 문자열을 sido/si/gu/dong/jibun으로 파싱 시도.
 
     예시:
-      "세종특별자치시 조치원읍" → {"sido": "세종특별자치시", "si": "", "gu": "", "dong": "조치원읍"}
-      "충청남도 천안시 서북구 불당동" → {"sido": "충청남도", "si": "천안시", "gu": "서북구", "dong": "불당동"}
-      "경기도 수원시 팔달구 매산로" → {"sido": "경기도", "si": "수원시", "gu": "팔달구", "dong": "매산로"}
+      "세종특별자치시 조치원읍"
+        → {"sido": "세종특별자치시", "si": "", "gu": "", "dong": "조치원읍"}
+      "충청남도 천안시 서북구 불당동"
+        → {"sido": "충청남도", "si": "천안시", "gu": "서북구", "dong": "불당동"}
+      "경기도 수원시 팔달구 매산로"
+        → {"sido": "경기도", "si": "수원시", "gu": "팔달구", "dong": "매산로"}
     """
     parts = keyword.strip().split()
     if not parts:
@@ -68,15 +73,16 @@ def _parse_keyword_to_region(keyword: str) -> dict[str, str]:
 
     if len(parts) >= 4:
         token = parts[3]
-        if any(token.endswith(s) for s in ["읍", "면", "동", "리", "로", "길"]) or not result["dong"]:
+        if any(token.endswith(s) for s in ["읍", "면", "동", "리", "로", "길"]) or not result[
+            "dong"
+        ]:
             result["dong"] = token
         else:
             result["jibun"] = token
 
-    if len(parts) >= 5:
+    if len(parts) >= 5 and not result["jibun"]:
         # 나머지는 번지로
-        if not result["jibun"]:
-            result["jibun"] = " ".join(parts[4:])
+        result["jibun"] = " ".join(parts[4:])
 
     return result
 

@@ -13,7 +13,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from src.core.config import settings
-from src.core.exceptions import KepcoAPIError, ScraperError
+from src.core.exceptions import KepcoAPIError, KepcoNoDataError, ScraperError
 from src.data.address import to_kepco_params
 from src.data.data_loader import load_records_from_uploaded_file
 from src.data.history_db import HistoryRepository
@@ -113,6 +113,68 @@ def _make_cache_key(mode: str, region: RegionInfo, jibun: str) -> str:
     return f"{mode}:{region.display_name}:{jibun.strip()}"
 
 
+def _fetch_online_with_cache(
+    region: RegionInfo,
+    jibun: str,
+    min_interval_seconds: float,
+) -> tuple[list[CapacityRecord] | None, str]:
+    """한전ON 브라우저 조회 결과를 세션 캐시에 저장 후 반환."""
+    try:
+        from src.data.scraper_service import fetch_capacity_by_online
+
+        mode = "online"
+        cache_key = _make_cache_key(mode, region, jibun)
+        cache = _get_session_cache()
+        cached_item = cache.get(cache_key)
+        now = _now_ts()
+
+        if isinstance(cached_item, dict):
+            ts = cached_item.get("ts")
+            recs = cached_item.get("records")
+            label = cached_item.get("label")
+            if isinstance(ts, (int, float)) and (now - float(ts)) < min_interval_seconds and recs:
+                remaining = int(min_interval_seconds - (now - float(ts)))
+                st.sidebar.info(f"최근 조회 결과를 사용합니다. 다음 갱신까지 {remaining}s")
+                return recs, str(label or region.display_name)
+
+        with st.spinner(f"🌐 한전ON에서 {region.display_name} 여유용량 조회 중..."):
+            records = fetch_capacity_by_online(
+                sido=region.sido,
+                sigungu=region.sigungu,
+                dong=region.dong if region.dong != "전체" else "",
+                jibun=jibun,
+            )
+
+        cache[cache_key] = {
+            "ts": now,
+            "records": records,
+            "label": region.display_name,
+        }
+        return records, f"{region.display_name} (한전ON)"
+
+    except ScraperError as exc:
+        st.sidebar.error(f"한전ON 스크래핑 실패: {exc.message}")
+        st.sidebar.markdown(
+            "**대안: 무료 API 키 발급**\n"
+            "1. [한전 전력데이터 개방포털](https://bigdata.kepco.co.kr) 접속\n"
+            "2. 회원가입 → 마이페이지 → API 인증키 발급\n"
+            "3. `.env` 또는 Streamlit Secrets에 `KEPCO_API_KEY=키` 설정"
+        )
+
+        # 샘플 데이터로 대시보드 미리보기 제공
+        from src.data.data_loader import load_sample_records
+
+        sample = load_sample_records()
+        if sample:
+            st.sidebar.success(f"📦 샘플 데이터 {len(sample)}건을 표시합니다.")
+            return sample, "샘플 데이터 (데모)"
+        return None, ""
+    except Exception as exc:
+        logger.exception("한전ON 스크래핑 실패")
+        st.sidebar.error(f"조회 실패: {exc}")
+        return None, ""
+
+
 def _render_query_sidebar() -> tuple[list[CapacityRecord] | None, str]:
     """사이드바에서 실시간 조회 또는 파일 업로드를 처리하고 (records, label)을 반환."""
     st.sidebar.header("⚡ 실시간 조회")
@@ -171,65 +233,26 @@ def _render_query_sidebar() -> tuple[list[CapacityRecord] | None, str]:
 
     # API 키가 없으면 한전ON(EWM092D00) 브라우저 스크래퍼로 폴백
     if not settings.kepco_api_key:
-        st.sidebar.warning("⚠️ KEPCO_API_KEY 미설정 → 한전ON 브라우저 조회 모드")
-        try:
-            from src.data.scraper_service import fetch_capacity_by_online
-
-            mode = "online"
-            cache_key = _make_cache_key(mode, region, jibun)
-            cache = _get_session_cache()
-            cached_item = cache.get(cache_key)
-            now = _now_ts()
-
-            if isinstance(cached_item, dict):
-                ts = cached_item.get("ts")
-                recs = cached_item.get("records")
-                label = cached_item.get("label")
-                if (
-                    isinstance(ts, (int, float))
-                    and (now - float(ts)) < min_interval_seconds
-                    and recs
-                ):
-                    remaining = int(min_interval_seconds - (now - float(ts)))
-                    st.sidebar.info(f"최근 조회 결과를 사용합니다. 다음 갱신까지 {remaining}s")
-                    return recs, str(label or region.display_name)
-
-            with st.spinner(f"🌐 한전ON에서 {region.display_name} 여유용량 조회 중..."):
-                records = fetch_capacity_by_online(
-                    sido=region.sido,
-                    sigungu=region.sigungu,
-                    dong=region.dong if region.dong != "전체" else "",
-                    jibun=jibun,
-                )
-
-            cache[cache_key] = {
-                "ts": now,
-                "records": records,
-                "label": region.display_name,
-            }
-            return records, f"{region.display_name} (한전ON)"
-
-        except ScraperError as exc:
-            st.sidebar.error(f"한전ON 스크래핑 실패: {exc.message}")
-            st.sidebar.markdown(
-                "**대안: 무료 API 키 발급**\n"
-                "1. [한전 전력데이터 개방포털](https://bigdata.kepco.co.kr) 접속\n"
-                "2. 회원가입 → 마이페이지 → API 인증키 발급\n"
-                "3. `.env` 또는 Streamlit Secrets에 `KEPCO_API_KEY=키` 설정"
+        if region.dong == "전체":
+            st.sidebar.warning(
+                "⚠️ KEPCO_API_KEY 미설정 상태에서는 읍/면/동 '전체' 조회를 지원하지 않습니다. "
+                "읍/면/동을 선택하거나 API 키를 설정해주세요."
             )
-
-            # 샘플 데이터로 대시보드 미리보기 제공
-            from src.data.data_loader import load_sample_records
-
-            sample = load_sample_records()
-            if sample:
-                st.sidebar.success(f"📦 샘플 데이터 {len(sample)}건을 표시합니다.")
-                return sample, "샘플 데이터 (데모)"
             return None, ""
-        except Exception as exc:
-            logger.exception("한전ON 스크래핑 실패")
-            st.sidebar.error(f"조회 실패: {exc}")
-            return None, ""
+        st.sidebar.warning("⚠️ KEPCO_API_KEY 미설정 → 한전ON 브라우저 조회 모드")
+        return _fetch_online_with_cache(region, jibun, min_interval_seconds)
+
+    if region.dong == "전체":
+        st.sidebar.info(
+            "ℹ️ 읍/면/동 '전체'는 동/리 미지정(OpenAPI 시군구 단위)으로 조회합니다. "
+            "지역이 넓을수록 결과가 많아 시간이 걸릴 수 있습니다."
+        )
+        if jibun:
+            st.sidebar.warning(
+                "읍/면/동 '전체' 조회에서는 지번을 사용할 수 없습니다. "
+                "지번은 무시하고 조회합니다."
+            )
+            jibun = ""
 
     try:
         params = to_kepco_params(region)
@@ -272,6 +295,9 @@ def _render_query_sidebar() -> tuple[list[CapacityRecord] | None, str]:
             "auto_reload": auto_reload,
         }
         return records, region.display_name
+    except KepcoNoDataError:
+        st.sidebar.warning("조회 결과가 없습니다. 읍/면/동 또는 지번을 변경해 다시 시도해보세요.")
+        return [], region.display_name
     except KepcoAPIError as exc:
         st.sidebar.error(f"한전 API 오류: {exc.message}")
 
@@ -327,7 +353,7 @@ def main() -> None:
         return
 
     if not records:
-        st.warning("조회 결과가 없습니다.")
+        st.warning(f"'{data_label or '선택한 지역'}' 조회 결과가 없습니다.")
         return
 
     st.subheader(f"📊 분석 결과 ({len(records)}건) · {data_label}")

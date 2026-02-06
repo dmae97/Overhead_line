@@ -18,10 +18,12 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from src.core.exceptions import ScraperError
-from src.data.models import CapacityRecord
+
+if TYPE_CHECKING:
+    from src.data.models import CapacityRecord
 
 logger = logging.getLogger(__name__)
 

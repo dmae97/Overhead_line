@@ -23,7 +23,14 @@ KEPCO_API_KEY = "your_40_char_api_key_here"
 ## 기능
 
 - 시/도 → 시/군/구 → 읍/면/동 3단계 지역 선택
+- 읍/면/동 "전체" 선택 시 OpenAPI 시군구 단위 조회 (동/리 미지정, **API 키 필요**)
 - 한전 REST API 기반 배전선로 여유용량 조회
 - 변전소/변압기/DL 여유용량 색상 코딩 테이블
 - Plotly 인터랙티브 바 차트
 - CSV/Excel 다운로드
+
+## 캐시 정책
+
+- 법정동코드: `st.cache_data(ttl=24h)` (앱 시작 시 1회 로드, `src/data/address.py`)
+- OpenAPI 응답: `st.cache_data(ttl=5min)` (키: `metroCd, cityCd, addrLidong, addrLi, addrJibun`, `src/utils/cache.py`)
+- UI 조회 간격: `st.session_state` 세션 캐시로 사용자가 설정한 "갱신 간격(분)" 내에서는 동일 결과를 재사용 (`src/app.py`)

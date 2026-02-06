@@ -34,6 +34,31 @@ class TestCapacityRecord:
         assert record.min_capacity == 3200
         assert record.is_connectable is True
 
+    def test_accepts_numeric_fields(self) -> None:
+        """실제 OpenAPI는 숫자 필드를 int/float로 반환할 수 있다."""
+        record = CapacityRecord(
+            substCd=2462,
+            substNm="공주",
+            dlCd=16,
+            dlNm="정안",
+            jsSubstPwr=0,
+            substPwr=0,
+            jsMtrPwr=0,
+            mtrPwr=0,
+            jsDlPwr=0,
+            dlPwr=0,
+            vol1=98973,
+            vol2=0,
+            vol3=1199,
+        )
+        assert record.subst_cd == "2462"
+        assert record.dl_cd == "16"
+        assert record.substation_capacity == 98973
+        assert record.transformer_capacity == 0
+        assert record.dl_capacity == 1199
+        assert record.min_capacity == 0
+        assert record.is_connectable is False
+
     def test_zero_capacity_not_connectable(self) -> None:
         record = CapacityRecord(vol1="0", vol2="5000", vol3="3000")
         assert record.min_capacity == 0

@@ -5,7 +5,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from src.core.exceptions import KepcoAPIError
+from src.core.exceptions import KepcoAPIError, KepcoNoDataError
 from src.data.kepco_api import KepcoApiClient
 from src.data.models import AddressParams
 
@@ -24,13 +24,14 @@ def test_fetch_capacity_parses_data_list() -> None:
     payload = {
         "data": [
             {
-                "substCd": "S001",
-                "substNm": "천안",
+                # 실제 OpenAPI는 숫자 필드를 int로 주는 경우가 많다.
+                "substCd": 2462,
+                "substNm": "공주",
                 "mtrNo": "#1",
-                "dlNm": "불당1",
-                "vol1": "20000",
-                "vol2": "10000",
-                "vol3": "3200",
+                "dlNm": "정안",
+                "vol1": 98973,
+                "vol2": 0,
+                "vol3": 1199,
             }
         ]
     }
@@ -43,7 +44,8 @@ def test_fetch_capacity_parses_data_list() -> None:
 
     records = client.fetch_capacity(AddressParams(metro_cd="44", city_cd="131"))
     assert len(records) == 1
-    assert records[0].subst_nm == "천안"
+    assert records[0].subst_nm == "공주"
+    assert records[0].dl_capacity == 1199
 
     client.close()
 
@@ -84,7 +86,7 @@ def test_fetch_capacity_no_data_raises() -> None:
     transport = httpx.MockTransport(handler)
     client = _make_client_with_transport(transport)
 
-    with pytest.raises(KepcoAPIError):
+    with pytest.raises(KepcoNoDataError):
         client.fetch_capacity(AddressParams(metro_cd="44", city_cd="131"))
 
     client.close()

@@ -43,6 +43,10 @@ class KepcoAPIError(OverheadLineError):
         super().__init__(message)
 
 
+class KepcoNoDataError(KepcoAPIError):
+    """한전 OpenAPI가 0건 응답을 반환한 경우."""
+
+
 class ScraperError(OverheadLineError):
     """브라우저 자동화(Playwright/Selenium) 기반 웹 조회 에러."""
 

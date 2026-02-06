@@ -13,7 +13,7 @@ import httpx
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from src.core.config import settings
-from src.core.exceptions import KepcoAPIError
+from src.core.exceptions import KepcoAPIError, KepcoNoDataError
 from src.data.models import AddressParams, CapacityRecord
 
 
@@ -104,7 +104,7 @@ class KepcoApiClient:
             msg = None
             if isinstance(payload, dict):
                 msg = payload.get("message") or payload.get("resultMsg")
-            raise KepcoAPIError(
+            raise KepcoNoDataError(
                 f"한전 API 응답에 데이터가 없습니다{f': {msg}' if msg else ''}",
                 status_code=resp.status_code,
             )
@@ -116,4 +116,9 @@ class KepcoApiClient:
             except Exception:
                 # 단일 레코드 문제로 전체 실패 방지
                 continue
+        if not records:
+            raise KepcoAPIError(
+                "한전 API 응답 파싱 실패 (레코드 검증 실패)",
+                status_code=resp.status_code,
+            )
         return records

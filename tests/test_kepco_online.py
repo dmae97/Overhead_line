@@ -11,12 +11,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from src.core.exceptions import ScraperError
-from src.data.kepco_online import (
-    KepcoOnlineScraper,
-    _clean_number,
-)
+from src.data.kepco_online import KepcoOnlineScraper, _clean_number
 from src.data.models import CapacityRecord
-
 
 # ---------------------------------------------------------------------------
 # _clean_number
@@ -225,6 +221,36 @@ class TestExtractRecordFromDict:
     def test_empty_dict(self) -> None:
         records = KepcoOnlineScraper._extract_record_from_dict({})
         assert records == []
+
+
+# ---------------------------------------------------------------------------
+# _strategy_js_api
+# ---------------------------------------------------------------------------
+
+
+class TestStrategyJsApi:
+    """_strategy_js_api 내부 API 실패 시 안전한 폴백 동작 테스트."""
+
+    def test_returns_empty_when_api_calls_fail(self) -> None:
+        """내부 XHR 호출이 전부 실패하면 DOM 파싱으로 '성공' 처리하지 않고 빈 리스트를 반환."""
+        scraper = KepcoOnlineScraper()
+        mock_page = MagicMock()
+        mock_page.evaluate.side_effect = Exception("HTTP 500")
+
+        with patch.object(KepcoOnlineScraper, "_parse_dom_results") as mock_parse_dom:
+            records = scraper._strategy_js_api(
+                mock_page,
+                sido="충청남도",
+                si="천안시",
+                gu="서북구",
+                dong="불당동",
+                li="",
+                jibun="",
+            )
+
+        assert records == []
+        mock_parse_dom.assert_not_called()
+        assert mock_page.evaluate.call_count == 2
 
 
 # ---------------------------------------------------------------------------

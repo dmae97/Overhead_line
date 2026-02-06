@@ -30,7 +30,12 @@ class CapacityRecord(BaseModel):
     alias를 사용하여 API 응답 필드명과 매핑한다.
     """
 
-    model_config = {"populate_by_name": True}
+    model_config = {
+        # Accept both API-style keys (aliases) and internal snake_case keys.
+        "populate_by_name": True,
+        # KEPCO OpenAPI returns numeric fields as int/float sometimes; coerce to str.
+        "coerce_numbers_to_str": True,
+    }
 
     # 변전소 정보
     subst_cd: str = Field(alias="substCd", default="", description="변전소 코드")

@@ -11,9 +11,12 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from src.core.exceptions import ScraperError
-from src.data.models import CapacityRecord
+
+if TYPE_CHECKING:
+    from src.data.models import CapacityRecord
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +64,9 @@ def _parse_keyword_to_region(keyword: str) -> dict[str, str]:
 
     if len(parts) >= 4:
         token = parts[3]
-        if any(token.endswith(s) for s in ["읍", "면", "동", "리", "로", "길"]) or not result["dong"]:
+        if any(token.endswith(s) for s in ["읍", "면", "동", "리", "로", "길"]) or not result[
+            "dong"
+        ]:
             result["dong"] = token
         else:
             result["jibun"] = token

@@ -26,8 +26,10 @@ import logging
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -134,7 +136,7 @@ def _ensure_playwright_browsers() -> None:
     logger.info("📦 Playwright chromium 브라우저 자동 설치 시도...")
     try:
         proc = subprocess.run(
-            ["python", "-m", "playwright", "install", "chromium"],
+            [sys.executable, "-m", "playwright", "install", "chromium"],
             capture_output=True,
             text=True,
             timeout=120,
@@ -307,10 +309,8 @@ class KepcoOnlineScraper:
                 ) from exc
             finally:
                 if browser:
-                    try:
+                    with suppress(Exception):
                         browser.close()
-                    except Exception:
-                        pass
 
     def fetch_capacity_by_region(
         self,
@@ -546,10 +546,10 @@ class KepcoOnlineScraper:
             except Exception as exc:
                 logger.warning("⚠️ L1 gbn='%s' 호출 실패: %s", gbn_value, exc)
 
-        # 모든 gbn 시도 후 DOM에서 결과가 채워졌는지 확인
-        # (API 호출 시 WebSquare가 DOM도 업데이트할 수 있음)
-        time.sleep(2)
-        return self._parse_dom_results(page)
+        # 내부 API 호출이 실패한 경우, 초기 로드/이전 조회 결과가 DOM에 남아있을 수 있어
+        # DOM 파싱으로 "성공" 처리하면 잘못된 데이터를 반환할 위험이 있다.
+        # (→ L2: DOM 자동화 전략으로 안전하게 폴백)
+        return []
 
     def _parse_api_response(self, data: Any) -> list[CapacityRecord]:
         """내부 API 응답에서 CapacityRecord를 추출 시도."""
@@ -626,13 +626,11 @@ class KepcoOnlineScraper:
 
         # 페이지를 새로 로드 (L1에서 상태가 바뀌었을 수 있음)
         page.goto(self._url, wait_until="domcontentloaded")
-        try:
+        with suppress(Exception):
             page.wait_for_function(
                 "() => typeof $w !== 'undefined'",
                 timeout=_WS_READY_TIMEOUT_MS,
             )
-        except Exception:
-            pass
         self._wait_for_select_options(page, _SELECT_IDS["sido"])
 
         # 주소 선택 (cascading)
@@ -692,25 +690,27 @@ class KepcoOnlineScraper:
 
             try:
                 options = self._get_select_options(page, select_id)
-                if not options:
-                    logger.warning("⚠️ '%s' select에 옵션이 없습니다.", name)
-                    continue
+                meaningful = [
+                    o.strip()
+                    for o in options
+                    if o and o.strip() and not o.strip().endswith("선택") and o.strip() != "선택"
+                ]
+                if not meaningful:
+                    raise ScraperError(
+                        f"'{name}' select 옵션 로딩 실패 (봇탐지/차단 가능). 옵션={options[:5]}"
+                    )
 
                 # 정확 매칭 우선 → 포함 매칭 → 첫 글자 매칭
                 matched_value = self._find_best_option(value, options)
                 if not matched_value:
-                    logger.warning(
-                        "⚠️ '%s' selectbox에서 '%s' 미발견. 옵션: %s",
-                        name,
-                        value,
-                        options[:10],
+                    raise ScraperError(
+                        f"'{name}' selectbox에서 '{value}' 옵션을 찾을 수 없습니다. "
+                        f"옵션 예시={meaningful[:10]}"
                     )
-                    continue
 
                 # WebSquare 호환 select 값 설정
                 if not self._set_select_value_robust(page, select_id, matched_value):
-                    logger.warning("⚠️ %s 선택 실패 (모든 방법): '%s'", name, matched_value)
-                    continue
+                    raise ScraperError(f"'{name}' select 값 설정 실패: '{matched_value}'")
                 logger.info("✅ %s 선택: '%s'", name, matched_value)
 
                 # 다음 select의 옵션이 로드될 때까지 대기
@@ -732,8 +732,10 @@ class KepcoOnlineScraper:
                     if next_value_needed or name in ("lidong", "li"):
                         self._wait_for_select_options(page, _SELECT_IDS[next_name])
 
+            except ScraperError:
+                raise
             except Exception as exc:
-                logger.warning("⚠️ %s 선택 실패 (%s): %s", name, value, exc)
+                raise ScraperError(f"{name} 선택 실패 ({value}): {exc}") from exc
 
         # 번지 선택
         self._select_bunji(page, jibun)
@@ -770,8 +772,15 @@ class KepcoOnlineScraper:
 
         우선순위: 정확매칭 > 포함매칭(value in option) > 포함매칭(option in value)
         """
-        # 빈 값 제거
-        valid = [o for o in options if o.strip()]
+        # 빈 값 / 플레이스홀더 제거 ("선택", "시/도 선택" 등)
+        valid = []
+        for opt in options:
+            text = opt.strip()
+            if not text:
+                continue
+            if text == "선택" or text.endswith("선택"):
+                continue
+            valid.append(text)
         if not valid:
             return None
 
@@ -797,18 +806,27 @@ class KepcoOnlineScraper:
         select_id: str,
         timeout_ms: int = _SELECT_OPTION_TIMEOUT_MS,
     ) -> None:
-        """특정 select 요소의 옵션이 1개 이상 로드될 때까지 대기."""
+        """특정 select 요소의 "의미있는" 옵션이 로드될 때까지 대기.
+
+        WebSquare select는 초기 로드 시 placeholder + 빈 옵션(예: ["시/도 선택", ""])처럼
+        옵션 길이만 2가 되는 경우가 있어, 단순 length>1 조건은 오탐이 발생한다.
+        """
         try:
             page.wait_for_function(
                 f"""() => {{
                     const sel = document.getElementById('{select_id}');
-                    return sel && sel.options.length > 1;
+                    if (!sel || !sel.options) return false;
+                    for (let i = 0; i < sel.options.length; i++) {{
+                        const t = (sel.options[i].text || '').trim();
+                        if (t.length > 0 && !t.endsWith('선택')) return true;
+                    }}
+                    return false;
                 }}""",
                 timeout=timeout_ms,
             )
         except Exception:
             # 타임아웃이어도 계속 진행 (옵션이 아예 없는 select일 수 있음)
-            pass
+            return
 
     @staticmethod
     def _get_select_options(page: Any, select_id: str) -> list[str]:
@@ -854,13 +872,17 @@ class KepcoOnlineScraper:
                     var comp = $w.getComponentById('{comp_id}');
                     if (comp) {{
                         // getItemCount + getItemText + setSelectedIndex
-                        var count = comp.getItemCount ? comp.getItemCount() : 0;
-                        for (var i = 0; i < count; i++) {{
-                            var text = comp.getItemText ? comp.getItemText(i) : '';
-                            if (text === label || text.indexOf(label) >= 0 || label.indexOf(text) >= 0) {{
-                                comp.setSelectedIndex(i);
-                                return 'ws_api';
-                            }}
+                            var count = comp.getItemCount ? comp.getItemCount() : 0;
+                            for (var i = 0; i < count; i++) {{
+                                var text = comp.getItemText ? comp.getItemText(i) : '';
+                                if (
+                                    text === label ||
+                                    text.indexOf(label) >= 0 ||
+                                    label.indexOf(text) >= 0
+                                ) {{
+                                    comp.setSelectedIndex(i);
+                                    return 'ws_api';
+                                }}
                         }}
                         // direct setValue 폴백
                         if (comp.setValue) {{
@@ -938,7 +960,9 @@ class KepcoOnlineScraper:
                 return true;
             }}
             // 폴백: 텍스트로 찾기
-            const buttons = document.querySelectorAll('button, a[role="button"], div[role="button"]');
+            const buttons = document.querySelectorAll(
+                'button, a[role="button"], div[role="button"]'
+            );
             for (const b of buttons) {{
                 if (b.textContent.includes('검색')) {{
                     b.click();
