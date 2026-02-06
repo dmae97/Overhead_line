@@ -121,6 +121,14 @@ class Settings:
             "https://home.kepco.co.kr/kepco/CO/H/E/COHEPP001/COHEPP00110.do?menuCd=FN420106",
         )
     )
+
+    # 한전ON (online.kepco.co.kr) EWM092D00 주소 검색 페이지
+    kepco_online_url: str = field(
+        default_factory=lambda: _get_str(
+            "KEPCO_ONLINE_URL",
+            "https://online.kepco.co.kr/EWM092D00",
+        )
+    )
     selenium_headless: bool = field(
         default_factory=lambda: _get_bool_default_true("SELENIUM_HEADLESS")
     )

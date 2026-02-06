@@ -1,9 +1,10 @@
-"""브라우저 자동화 스크래퍼 통합 서비스 — Playwright 우선, Selenium 폴백.
+"""브라우저 자동화 스크래퍼 통합 서비스 — 한전ON(EWM092D00) 우선, 기존 Playwright/Selenium 폴백.
 
 API 키가 없을 때 한전ON 접속가능 용량조회를 브라우저 자동화로 수행한다.
 엔진 우선순위:
-  1. Playwright (경량, 네이티브 response 이벤트, stealth 내장)
-  2. Selenium (레거시 폴백 — Playwright 미설치/실패 시)
+  1. 한전ON EWM092D00 (online.kepco.co.kr — Playwright 기반, 주소 cascading)
+  2. Playwright 기존 (home.kepco.co.kr — 키워드 검색, 봇탐지 가능성 있음)
+  3. Selenium (레거시 폴백)
 
 설정:
   - SCRAPER_ENGINE 환경변수로 1차 엔진 지정 (기본 "playwright")
@@ -34,8 +35,38 @@ RETRY_DELAY_SECONDS = 3.0
 # (각 패키지가 미설치여도 import 시점에 앱이 죽지 않도록 lazy import)
 
 
+def _run_kepco_online(
+    keyword: str,
+    sido: str = "",
+    sigungu: str = "",
+    dong: str = "",
+    jibun: str = "",
+) -> list[CapacityRecord]:
+    """한전ON EWM092D00 (online.kepco.co.kr) Playwright 엔진으로 용량 조회.
+
+    keyword는 호환성을 위해 받지만, sido/sigungu/dong이 제공되면 우선 사용한다.
+    """
+    from src.data.kepco_online import KepcoOnlineScraper
+
+    scraper = KepcoOnlineScraper()
+    if sido:
+        return scraper.fetch_capacity_by_region(sido=sido, sigungu=sigungu, dong=dong, jibun=jibun)
+    # keyword만 제공된 경우 — 파싱 시도 (시도명 추출)
+    # "충청남도 천안시 서북구 불당동 142-1" 같은 형태
+    parts = keyword.strip().split()
+    if parts:
+        return scraper.fetch_capacity(
+            sido=parts[0],
+            si=parts[1] if len(parts) > 1 else "",
+            gu=parts[2] if len(parts) > 2 else "",
+            dong=parts[3] if len(parts) > 3 else "",
+            jibun=parts[4] if len(parts) > 4 else "",
+        )
+    raise ScraperError("검색 키워드가 비어있습니다.")
+
+
 def _run_playwright(keyword: str) -> list[CapacityRecord]:
-    """Playwright 엔진으로 용량 조회."""
+    """Playwright 엔진으로 용량 조회 (기존 home.kepco.co.kr)."""
     from src.data.kepco_playwright import KepcoPlaywrightScraper
 
     scraper = KepcoPlaywrightScraper()
@@ -178,3 +209,73 @@ def fetch_capacity_by_browser(keyword: str) -> list[CapacityRecord]:
     )
 
     raise ScraperError("\n".join(summary_lines))
+
+
+def fetch_capacity_by_online(
+    sido: str,
+    sigungu: str,
+    dong: str = "",
+    jibun: str = "",
+) -> list[CapacityRecord]:
+    """한전ON(EWM092D00) Playwright 스크래퍼로 직접 용량 조회.
+
+    API 키 없이 사용 가능. 주소 기반 cascading 선택 후 DOM에서 결과를 파싱.
+
+    Args:
+        sido: 시/도 (예: "충청남도")
+        sigungu: 시군구 (예: "천안시 서북구")
+        dong: 읍/면/동 (예: "불당동")
+        jibun: 번지 (선택)
+
+    Returns:
+        CapacityRecord 리스트
+
+    Raises:
+        ScraperError: 브라우저 자동화 실패
+    """
+    last_exc: Exception | None = None
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            logger.info(
+                "🚀 [kepco_online] 시도 %d/%d: %s %s %s",
+                attempt,
+                MAX_RETRIES,
+                sido,
+                sigungu,
+                dong,
+            )
+            records = _run_kepco_online(
+                keyword="",
+                sido=sido,
+                sigungu=sigungu,
+                dong=dong,
+                jibun=jibun,
+            )
+            logger.info(
+                "✅ [kepco_online] 조회 성공 — %d건 반환",
+                len(records),
+            )
+            return records
+        except ScraperError as exc:
+            last_exc = exc
+            if "설치" in exc.message or "import" in exc.message.lower():
+                break
+            logger.warning(
+                "⚠️ [kepco_online] 시도 %d 실패: %s",
+                attempt,
+                exc.message[:200],
+            )
+        except Exception as exc:
+            last_exc = exc
+            logger.warning(
+                "⚠️ [kepco_online] 시도 %d 예외: %s",
+                attempt,
+                str(exc)[:200],
+            )
+
+        if attempt < MAX_RETRIES:
+            time.sleep(RETRY_DELAY_SECONDS)
+
+    assert last_exc is not None
+    raise last_exc
