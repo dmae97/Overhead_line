@@ -1,32 +1,35 @@
-"""한전ON (online.kepco.co.kr) Playwright 기반 여유용량 스크래퍼.
+"""한전ON (online.kepco.co.kr) Playwright 기반 여유용량 스크래퍼 — 고도화 버전.
 
 타겟 페이지: https://online.kepco.co.kr/EWM092D00 (주소로 검색)
 
-전략:
-1. Playwright로 EWM092D00 페이지 로드
-2. Native <select> 요소에 select_option()으로 값 설정
-   — WebSquare가 native change 이벤트를 인식하여 cascading 자동 처리
-3. 검색 버튼 클릭
-4. 결과 영역(wframe01) DOM에서 용량 데이터를 파싱
+3계층 폴백 전략:
+  L1) Playwright → 내부 JS API 직접 호출 (page.evaluate + fetch)
+      브라우저 세션/쿠키를 자동 활용하므로 가장 빠르고 안정적
+  L2) Playwright → DOM 풀 자동화 (select_option + 검색 버튼 클릭)
+      L1 실패 시 폴백. 대기/재시도 로직 대폭 강화
 
-내부 API 엔드포인트 (참고):
-- POST /ew/cpct/retrieveAddrGbn  — 주소 cascading (gbn: 0=시→시, 1=시→구, 2=구→동, ...)
-- POST /ew/cpct/retrieveMeshNo   — 검색 (mesh 번호 조회 → 용량 데이터 로드)
-
-주의:
-- WebSquare SPA이므로 native DOM 이벤트(change)만으로 cascading 작동
-- 결과 데이터는 API 응답이 아닌 DOM 요소에 직접 주입됨
-- wframe01이 display:none → visible로 전환되면 데이터 로드 완료
+각 계층 내 개선사항:
+  - WebSquare 준비 대기 ($w 전역 객체 확인)
+  - select 옵션 로드 대기 (time.sleep → wait_for_function)
+  - 검색 결과 다중 필드 검증 (dl_nm OR vol1 OR subst_nm)
+  - 검색 실패 시 최대 3회 재클릭
+  - Dialog/Alert 자동 해제
+  - 실패 시 스크린샷 + HTML 덤프 → 로그
+  - 자동화 감지 우회 강화
+  - Launch args 최적화 (Streamlit Cloud 호환)
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from src.core.config import settings
@@ -35,7 +38,9 @@ from src.data.models import CapacityRecord
 
 logger = logging.getLogger(__name__)
 
-# WebSquare selectbox 요소 ID 매핑
+# ---------------------------------------------------------------------------
+# 상수: WebSquare selectbox 요소 ID
+# ---------------------------------------------------------------------------
 _SELECT_IDS = {
     "sido": "mf_wfm_layout_sbx_sido_input_0",
     "si": "mf_wfm_layout_sbx_si_input_0",
@@ -45,7 +50,7 @@ _SELECT_IDS = {
     "bunji": "mf_wfm_layout_sbx_bunji_input_0",
 }
 
-# 결과 DOM 요소 ID 매핑 (wframe01 내부)
+# 결과 DOM 요소 ID (wframe01 내부)
 _RESULT_IDS = {
     "subst_nm": "mf_wfm_layout_wframe01_txt_subst_nm_label",
     "mtr_no": "mf_wfm_layout_wframe01_txt_mtr_no_label",
@@ -74,31 +79,37 @@ _RESULT_IDS = {
     "dl_yn": "mf_wfm_layout_wframe01_txt_dlYn",
 }
 
-# 검색 버튼 ID
+# 검색 버튼 / 결과 프레임
 _SEARCH_BTN_ID = "mf_wfm_layout_btn_search"
-# 결과 프레임 ID
 _RESULT_FRAME_ID = "mf_wfm_layout_wframe01"
 
-# EWM092D00 기본 URL
 DEFAULT_EWM_URL = "https://online.kepco.co.kr/EWM092D00"
 
-# 각 select 단계별 대기 시간 (초)
-_SELECT_WAIT_SECONDS = 3.0
-# 검색 결과 대기 시간 (초)
-_SEARCH_WAIT_SECONDS = 10.0
+# 대기 상한 (ms)
+_WS_READY_TIMEOUT_MS = 20_000  # WebSquare $w 로드 대기
+_SELECT_OPTION_TIMEOUT_MS = 8_000  # 개별 select 옵션 로드 대기
+_SEARCH_RESULT_TIMEOUT_MS = 20_000  # 검색 결과 DOM 대기
+_MAX_SEARCH_CLICKS = 3  # 검색 재클릭 최대 횟수
+
+# 디버그 스냅샷 저장 디렉토리
+_DEBUG_DIR = Path(tempfile.gettempdir()) / "kepco_debug"
+
+
+# ---------------------------------------------------------------------------
+# 유틸리티
+# ---------------------------------------------------------------------------
 
 
 def _clean_number(text: str) -> str:
-    """WebSquare 숫자 텍스트에서 콤마·공백을 제거하고 순수 숫자 문자열 반환.
+    """WebSquare 숫자 텍스트에서 콤마·공백·단위를 제거하고 순수 숫자 문자열 반환.
 
-    예: "159,,000" → "159000", "13,000" → "13000", "0" → "0"
+    예: "159,,000" → "159000", "13,000kW" → "13000", "" → "0"
     """
     if not text:
         return "0"
     cleaned = re.sub(r"[,\s]", "", text.strip())
     if not cleaned:
         return "0"
-    # 혹시 숫자가 아닌 문자가 섞여 있으면 숫자만 추출
     digits = re.sub(r"[^\d\-.]", "", cleaned)
     return digits if digits else "0"
 
@@ -140,6 +151,28 @@ def _ensure_playwright_browsers() -> None:
         logger.warning("⚠️ Playwright 자동설치 중 예외: %s", exc)
 
 
+def _save_debug_snapshot(page: Any, label: str) -> None:
+    """실패 디버깅용 스크린샷 + HTML 덤프를 저장한다."""
+    try:
+        _DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+        ts = int(time.time())
+        # 스크린샷
+        ss_path = _DEBUG_DIR / f"{label}_{ts}.png"
+        page.screenshot(path=str(ss_path), full_page=True)
+        logger.info("📸 디버그 스크린샷 저장: %s", ss_path)
+        # HTML 덤프
+        html_path = _DEBUG_DIR / f"{label}_{ts}.html"
+        html_path.write_text(page.content(), encoding="utf-8")
+        logger.info("📄 디버그 HTML 저장: %s", html_path)
+    except Exception as exc:
+        logger.warning("디버그 스냅샷 저장 실패: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# 옵션 데이터클래스
+# ---------------------------------------------------------------------------
+
+
 @dataclass(frozen=True)
 class OnlineScraperOptions:
     """한전ON 스크래퍼 옵션."""
@@ -154,8 +187,13 @@ class OnlineScraperOptions:
     browser_type: str = field(default_factory=lambda: settings.playwright_browser_type)
 
 
+# ---------------------------------------------------------------------------
+# 메인 스크래퍼 클래스
+# ---------------------------------------------------------------------------
+
+
 class KepcoOnlineScraper:
-    """한전ON EWM092D00 Playwright 기반 용량 조회 스크래퍼.
+    """한전ON EWM092D00 Playwright 기반 용량 조회 스크래퍼 — 고도화 버전.
 
     사용법::
 
@@ -166,6 +204,10 @@ class KepcoOnlineScraper:
             gu="서북구",
             dong="불당동",
         )
+
+    3계층 전략:
+      L1) 브라우저 내 JS fetch()로 내부 API 직접 호출
+      L2) DOM 풀 자동화 (개선판)
     """
 
     def __init__(
@@ -175,6 +217,10 @@ class KepcoOnlineScraper:
     ) -> None:
         self._url = url or DEFAULT_EWM_URL
         self._options = options or OnlineScraperOptions()
+
+    # ===================================================================
+    # 공개 메서드
+    # ===================================================================
 
     def fetch_capacity(
         self,
@@ -189,17 +235,17 @@ class KepcoOnlineScraper:
 
         Args:
             sido: 시/도 (예: "충청남도")
-            si: 시 (예: "천안시", 빈 문자열이면 스킵)
+            si: 시 (예: "천안시")
             gu: 구/군 (예: "서북구")
             dong: 동/면 (예: "불당동")
-            li: 리 (예: "동산리", 선택사항)
-            jibun: 상세번지 (예: "1", 선택사항)
+            li: 리 (선택)
+            jibun: 상세번지 (선택)
 
         Returns:
             CapacityRecord 리스트 (최소 1건)
 
         Raises:
-            ScraperError: 브라우저 자동화 실패, 결과 없음 등
+            ScraperError: 모든 전략이 실패한 경우
         """
         try:
             from playwright.sync_api import sync_playwright
@@ -209,52 +255,53 @@ class KepcoOnlineScraper:
                 "설치: `pip install playwright && playwright install chromium`"
             ) from exc
 
+        errors: list[str] = []
+
         with sync_playwright() as pw:
             browser = None
+            page = None
             try:
                 browser = self._launch_browser(pw)
-                context = browser.new_context(
-                    viewport={"width": 1400, "height": 900},
-                    locale="ko-KR",
-                    extra_http_headers={
-                        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-                    },
+                page = self._create_page(browser)
+
+                # 페이지 로드 + WebSquare 준비
+                self._navigate_and_wait(page)
+
+                # L1: 브라우저 내 JS API 직접 호출
+                try:
+                    records = self._strategy_js_api(page, sido, si, gu, dong, li, jibun)
+                    if records:
+                        logger.info("✅ L1(JS API) 전략 성공 — %d건", len(records))
+                        return records
+                except Exception as exc:
+                    msg = f"L1(JS API) 실패: {type(exc).__name__}: {exc}"
+                    errors.append(msg)
+                    logger.warning("⚠️ %s", msg)
+
+                # L2: DOM 풀 자동화 (강화판)
+                try:
+                    records = self._strategy_dom_automation(page, sido, si, gu, dong, li, jibun)
+                    if records:
+                        logger.info("✅ L2(DOM 자동화) 전략 성공 — %d건", len(records))
+                        return records
+                except Exception as exc:
+                    msg = f"L2(DOM 자동화) 실패: {type(exc).__name__}: {exc}"
+                    errors.append(msg)
+                    logger.warning("⚠️ %s", msg)
+                    # 실패 시 디버그 스냅샷
+                    if page:
+                        _save_debug_snapshot(page, "L2_fail")
+
+                raise ScraperError(
+                    f"'{sido} {si} {gu} {dong}' 조회 실패 (모든 전략 소진).\n" + "\n".join(errors)
                 )
-                # 자동화 감지 우회
-                context.add_init_script("""
-                    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                    window.chrome = { runtime: {} };
-                """)
-
-                page = context.new_page()
-                page.set_default_timeout(self._options.page_load_timeout_ms)
-
-                logger.info("📡 한전ON EWM092D00 페이지 로딩: %s", self._url)
-                page.goto(self._url, wait_until="networkidle")
-                time.sleep(2)  # WebSquare 초기화 대기
-                logger.info("✅ 페이지 로드 완료: %s", page.url)
-
-                # 주소 선택 (cascading)
-                self._select_address(page, sido, si, gu, dong, li, jibun)
-
-                # 검색 실행
-                self._click_search(page)
-
-                # 결과 DOM 파싱
-                records = self._parse_results(page)
-
-                if not records:
-                    raise ScraperError(
-                        f"'{sido} {si} {gu} {dong}'에 대한 여유용량 결과를 찾지 못했습니다."
-                    )
-
-                logger.info("✅ %d건의 여유용량 레코드 파싱 완료", len(records))
-                return records
 
             except ScraperError:
                 raise
             except Exception as exc:
-                logger.exception("한전ON 스크래핑 실패")
+                logger.exception("한전ON 스크래핑 치명적 오류")
+                if page:
+                    _save_debug_snapshot(page, "fatal")
                 raise ScraperError(
                     f"한전ON 브라우저 자동화 오류: {type(exc).__name__}: {exc}"
                 ) from exc
@@ -275,15 +322,6 @@ class KepcoOnlineScraper:
         """RegionInfo 스타일 입력으로 조회.
 
         sigungu를 "시 + 구/군"으로 분리하여 내부 fetch_capacity 호출.
-
-        Args:
-            sido: 시/도명 (예: "충청남도")
-            sigungu: 시군구명 (예: "천안시 서북구", "세종특별자치시")
-            dong: 읍면동명 (예: "불당동")
-            jibun: 상세번지
-
-        Returns:
-            CapacityRecord 리스트
         """
         si, gu = self._split_sigungu(sigungu, sido)
         return self.fetch_capacity(sido=sido, si=si, gu=gu, dong=dong, jibun=jibun)
@@ -295,17 +333,336 @@ class KepcoOnlineScraper:
         예:
           "천안시 서북구" → ("천안시", "서북구")
           "천안시" → ("천안시", "")
-          "세종특별자치시" → ("", "")  # sido와 동일하면 시군구 없음
+          "세종특별자치시" → ("", "")
         """
         if not sigungu or sigungu == sido:
             return ("", "")
-
         parts = sigungu.strip().split()
         if len(parts) >= 2:
             return (parts[0], " ".join(parts[1:]))
         return (sigungu.strip(), "")
 
-    def _select_address(
+    # ===================================================================
+    # 브라우저 / 페이지 셋업
+    # ===================================================================
+
+    def _launch_browser(self, pw: Any) -> Any:
+        """Playwright 브라우저 인스턴스 실행 (3단계 폴백)."""
+        browser_type_name = self._options.browser_type.lower()
+        launcher = getattr(pw, browser_type_name, pw.chromium)
+
+        launch_args = []
+        if browser_type_name == "chromium":
+            launch_args = [
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-gpu",
+                "--disable-extensions",
+                "--disable-background-timer-throttling",
+                "--disable-backgrounding-occluded-windows",
+                "--disable-renderer-backgrounding",
+                "--disable-ipc-flooding-protection",
+                "--force-color-profile=srgb",
+                "--metrics-recording-only",
+                "--no-first-run",
+            ]
+
+        # 1차: Playwright 관리 바이너리
+        try:
+            return launcher.launch(headless=self._options.headless, args=launch_args)
+        except Exception as first_err:
+            logger.warning("⚠️ Playwright 바이너리 실패: %s", str(first_err)[:200])
+
+        # 2차: 자동 설치 후 재시도
+        _ensure_playwright_browsers()
+        try:
+            return launcher.launch(headless=self._options.headless, args=launch_args)
+        except Exception as second_err:
+            logger.warning("⚠️ 자동설치 후 실패: %s", str(second_err)[:200])
+
+        # 3차: 시스템 chromium 폴백
+        system_chromium = _find_system_chromium()
+        if system_chromium and browser_type_name == "chromium":
+            try:
+                return launcher.launch(
+                    headless=self._options.headless,
+                    executable_path=system_chromium,
+                    args=launch_args,
+                )
+            except Exception as third_err:
+                raise ScraperError(
+                    f"Playwright 브라우저 실행 실패 (3단계 모두 실패): {third_err}"
+                ) from third_err
+
+        raise ScraperError(
+            "Playwright 브라우저를 실행할 수 없습니다.\n해결: `playwright install chromium` 실행"
+        )
+
+    def _create_page(self, browser: Any) -> Any:
+        """자동화 감지 우회 + dialog 핸들러가 설정된 페이지를 생성."""
+        context = browser.new_context(
+            viewport={"width": 1400, "height": 900},
+            locale="ko-KR",
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            extra_http_headers={
+                "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+            },
+        )
+
+        # 자동화 감지 우회 스크립트
+        context.add_init_script("""
+            // navigator.webdriver 숨기기
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            // chrome 런타임 위장
+            window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){} };
+            // 플러그인 위장
+            Object.defineProperty(navigator, 'plugins', {
+                get: () => [1, 2, 3, 4, 5]
+            });
+            // languages
+            Object.defineProperty(navigator, 'languages', {
+                get: () => ['ko-KR', 'ko', 'en-US', 'en']
+            });
+            // permissions
+            const originalQuery = window.navigator.permissions.query;
+            window.navigator.permissions.query = (params) =>
+                params.name === 'notifications'
+                    ? Promise.resolve({ state: Notification.permission })
+                    : originalQuery(params);
+        """)
+
+        page = context.new_page()
+        page.set_default_timeout(self._options.page_load_timeout_ms)
+
+        # Dialog(alert/confirm/prompt) 자동 해제
+        page.on("dialog", lambda dialog: dialog.dismiss())
+
+        return page
+
+    def _navigate_and_wait(self, page: Any) -> None:
+        """EWM092D00 페이지를 로드하고 WebSquare가 준비될 때까지 대기."""
+        logger.info("📡 한전ON EWM092D00 페이지 로딩: %s", self._url)
+
+        # domcontentloaded 사용 — networkidle은 SPA에서 불안정
+        page.goto(self._url, wait_until="domcontentloaded")
+        logger.info("📄 DOM 로드 완료, WebSquare 초기화 대기 중...")
+
+        # WebSquare 전역 객체($w) 대기
+        try:
+            page.wait_for_function(
+                "() => typeof $w !== 'undefined' && typeof $w.getComponentById === 'function'",
+                timeout=_WS_READY_TIMEOUT_MS,
+            )
+            logger.info("✅ WebSquare 준비 완료")
+        except Exception:
+            logger.warning(
+                "⏰ WebSquare $w 대기 타임아웃 (%dms) — 계속 진행",
+                _WS_READY_TIMEOUT_MS,
+            )
+
+        # 추가: 첫 번째 select(sido)에 옵션이 로드될 때까지 대기
+        self._wait_for_select_options(page, _SELECT_IDS["sido"])
+        logger.info("✅ 페이지 준비 완료: %s", page.url)
+
+    # ===================================================================
+    # L1: 브라우저 내 JS API 직접 호출
+    # ===================================================================
+
+    def _strategy_js_api(
+        self,
+        page: Any,
+        sido: str,
+        si: str,
+        gu: str,
+        dong: str,
+        li: str,
+        jibun: str,
+    ) -> list[CapacityRecord]:
+        """L1 전략: page.evaluate()로 한전ON 내부 REST API를 직접 호출.
+
+        브라우저 세션/쿠키를 자동 활용하므로 인증 문제 없음.
+        select 조작 없이 API만으로 데이터 획득.
+        """
+        logger.info("🔬 L1 전략: JS API 직접 호출 시도")
+
+        # gbn 값 후보: "" (기본), "5" (전체 필드 검색 모드)
+        gbn_candidates = ["", "5"]
+
+        for gbn_value in gbn_candidates:
+            addr_params = {
+                "gbn": gbn_value,
+                "addr_do": sido,
+                "addr_si": si,
+                "addr_gu": gu,
+                "addr_lidong": dong,
+                "addr_li": li,
+                "addr_jibun": jibun or "1",
+            }
+
+            logger.info("🔬 L1 retrieveMeshNo 호출 (gbn='%s')", gbn_value)
+
+            try:
+                result = page.evaluate(
+                    """(params) => {
+                    return new Promise((resolve, reject) => {
+                        const xhr = new XMLHttpRequest();
+                        xhr.open('POST', '/ew/cpct/retrieveMeshNo', true);
+                        xhr.setRequestHeader('Content-Type', 'application/json;charset=UTF-8');
+                        xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
+                        xhr.timeout = 15000;
+                        xhr.onload = function() {
+                            if (xhr.status === 200) {
+                                try {
+                                    resolve(JSON.parse(xhr.responseText));
+                                } catch(e) {
+                                    resolve({_raw: xhr.responseText.substring(0, 2000)});
+                                }
+                            } else {
+                                reject(new Error('HTTP ' + xhr.status));
+                            }
+                        };
+                        xhr.onerror = function() { reject(new Error('XHR error')); };
+                        xhr.ontimeout = function() { reject(new Error('XHR timeout')); };
+                        xhr.send(JSON.stringify({dma_addrGbn: params}));
+                    });
+                }""",
+                    addr_params,
+                )
+
+                logger.info(
+                    "🔬 L1 retrieveMeshNo 응답 (gbn='%s'): %s",
+                    gbn_value,
+                    str(result)[:500],
+                )
+
+                records = self._parse_api_response(result)
+                if records:
+                    return records
+            except Exception as exc:
+                logger.warning("⚠️ L1 gbn='%s' 호출 실패: %s", gbn_value, exc)
+
+        # 모든 gbn 시도 후 DOM에서 결과가 채워졌는지 확인
+        # (API 호출 시 WebSquare가 DOM도 업데이트할 수 있음)
+        time.sleep(2)
+        return self._parse_dom_results(page)
+
+    def _parse_api_response(self, data: Any) -> list[CapacityRecord]:
+        """내부 API 응답에서 CapacityRecord를 추출 시도."""
+        if not isinstance(data, dict):
+            return []
+
+        # 한전ON 내부 API 응답 구조 분석 (가능한 필드들)
+        # dma_result 또는 dlt_result 등에 데이터가 있을 수 있음
+        for key in ["dma_result", "dlt_result", "result", "data"]:
+            item = data.get(key)
+            if isinstance(item, dict):
+                return self._extract_record_from_dict(item)
+            if isinstance(item, list) and item:
+                records = []
+                for entry in item:
+                    if isinstance(entry, dict):
+                        recs = self._extract_record_from_dict(entry)
+                        records.extend(recs)
+                if records:
+                    return records
+
+        # 최상위에 직접 결과가 있는 경우
+        if data.get("subst_nm") or data.get("dl_nm"):
+            return self._extract_record_from_dict(data)
+
+        return []
+
+    @staticmethod
+    def _extract_record_from_dict(d: dict) -> list[CapacityRecord]:
+        """딕셔너리에서 용량 레코드 추출."""
+        subst_nm = str(d.get("subst_nm", d.get("substNm", "")))
+        dl_nm = str(d.get("dl_nm", d.get("dlNm", "")))
+        if not subst_nm and not dl_nm:
+            return []
+
+        record = CapacityRecord(
+            substNm=subst_nm,
+            mtrNo=str(d.get("mtr_no", d.get("mtrNo", ""))),
+            dlNm=dl_nm,
+            jsSubstPwr=_clean_number(str(d.get("js_subst_pwr", d.get("jsSubstPwr", "0")))),
+            substPwr=_clean_number(str(d.get("subst_pwr", d.get("substPwr", "0")))),
+            jsMtrPwr=_clean_number(str(d.get("js_mtr_pwr", d.get("jsMtrPwr", "0")))),
+            mtrPwr=_clean_number(str(d.get("mtr_pwr", d.get("mtrPwr", "0")))),
+            jsDlPwr=_clean_number(str(d.get("js_dl_pwr", d.get("jsDlPwr", "0")))),
+            dlPwr=_clean_number(str(d.get("dl_pwr", d.get("dlPwr", "0")))),
+            vol1=_clean_number(str(d.get("vol1", d.get("subst_vol1", "0")))),
+            vol2=_clean_number(str(d.get("vol2", d.get("mtr_vol2", "0")))),
+            vol3=_clean_number(str(d.get("vol3", d.get("dl_vol3", "0")))),
+        )
+        return [record]
+
+    # ===================================================================
+    # L2: DOM 풀 자동화 (강화판)
+    # ===================================================================
+
+    def _strategy_dom_automation(
+        self,
+        page: Any,
+        sido: str,
+        si: str,
+        gu: str,
+        dong: str,
+        li: str,
+        jibun: str,
+    ) -> list[CapacityRecord]:
+        """L2 전략: select 조작 + 검색 버튼 클릭 + DOM 파싱.
+
+        기존 방식을 대폭 개선:
+          - select 옵션 로드 대기 (wait_for_function)
+          - 검색 최대 3회 재클릭
+          - 결과 다중 필드 검증
+        """
+        logger.info("🔧 L2 전략: DOM 풀 자동화 시도")
+
+        # 페이지를 새로 로드 (L1에서 상태가 바뀌었을 수 있음)
+        page.goto(self._url, wait_until="domcontentloaded")
+        try:
+            page.wait_for_function(
+                "() => typeof $w !== 'undefined'",
+                timeout=_WS_READY_TIMEOUT_MS,
+            )
+        except Exception:
+            pass
+        self._wait_for_select_options(page, _SELECT_IDS["sido"])
+
+        # 주소 선택 (cascading)
+        self._select_address_robust(page, sido, si, gu, dong, li, jibun)
+
+        # 검색 실행 (최대 _MAX_SEARCH_CLICKS 회)
+        result_found = False
+        for click_num in range(1, _MAX_SEARCH_CLICKS + 1):
+            logger.info("🔍 검색 버튼 클릭 (%d/%d)", click_num, _MAX_SEARCH_CLICKS)
+            self._click_search_button(page)
+
+            if self._wait_for_results(page):
+                result_found = True
+                break
+
+            logger.warning("⏰ 클릭 %d: 결과 미감지, 재시도...", click_num)
+            time.sleep(1)
+
+        if not result_found:
+            # 마지막 시도: DOM에 이미 데이터가 있는지 확인 (display:none 이슈)
+            logger.info("🔍 최종 DOM 데이터 확인...")
+
+        records = self._parse_dom_results(page)
+        if not records:
+            _save_debug_snapshot(page, "L2_no_results")
+            raise ScraperError(f"'{sido} {si} {gu} {dong}' 검색 결과를 DOM에서 찾지 못했습니다.")
+
+        return records
+
+    def _select_address_robust(
         self,
         page: Any,
         sido: str,
@@ -315,7 +672,7 @@ class KepcoOnlineScraper:
         li: str,
         jibun: str,
     ) -> None:
-        """Cascading selectbox에 주소를 설정."""
+        """Cascading selectbox에 주소를 설정 — 각 단계마다 옵션 로드 대기."""
         steps = [
             ("sido", sido),
             ("si", si),
@@ -329,57 +686,129 @@ class KepcoOnlineScraper:
                 continue
 
             select_id = _SELECT_IDS[name]
+
+            # 옵션 목록 로드 대기
+            self._wait_for_select_options(page, select_id)
+
             try:
-                # 옵션 목록에서 매칭되는 항목 확인
                 options = self._get_select_options(page, select_id)
-                if value not in options:
+                if not options:
+                    logger.warning("⚠️ '%s' select에 옵션이 없습니다.", name)
+                    continue
+
+                # 정확 매칭 우선 → 포함 매칭 → 첫 글자 매칭
+                matched_value = self._find_best_option(value, options)
+                if not matched_value:
                     logger.warning(
-                        "⚠️ '%s' selectbox에서 '%s'을(를) 찾을 수 없습니다. 옵션: %s",
+                        "⚠️ '%s' selectbox에서 '%s' 미발견. 옵션: %s",
                         name,
                         value,
                         options[:10],
                     )
-                    # 부분 매칭 시도
-                    matched = [o for o in options if value in o or o in value]
-                    if matched:
-                        value = matched[0]
-                        logger.info("→ 부분 매칭: '%s'", value)
-                    else:
-                        continue
+                    continue
 
-                page.select_option(f"#{select_id}", label=value)
-                logger.info("✅ %s 선택: %s", name, value)
-                time.sleep(_SELECT_WAIT_SECONDS)
+                # WebSquare 호환 select 값 설정
+                if not self._set_select_value_robust(page, select_id, matched_value):
+                    logger.warning("⚠️ %s 선택 실패 (모든 방법): '%s'", name, matched_value)
+                    continue
+                logger.info("✅ %s 선택: '%s'", name, matched_value)
+
+                # 다음 select의 옵션이 로드될 때까지 대기
+                next_steps = {
+                    "sido": "si",
+                    "si": "gu",
+                    "gu": "lidong",
+                    "lidong": "li",
+                    "li": "bunji",
+                }
+                next_name = next_steps.get(name)
+                if next_name and next_name in _SELECT_IDS:
+                    # 다음 단계에 값이 필요한지 확인
+                    next_value_needed = False
+                    for future_name, future_value in steps:
+                        if future_name == next_name and future_value and future_value != "전체":
+                            next_value_needed = True
+                            break
+                    if next_value_needed or name in ("lidong", "li"):
+                        self._wait_for_select_options(page, _SELECT_IDS[next_name])
 
             except Exception as exc:
                 logger.warning("⚠️ %s 선택 실패 (%s): %s", name, value, exc)
 
-        # 번지 선택 (인덱스 기반 — 첫 번째 유효 항목)
-        if jibun:
-            try:
-                bunji_options = self._get_select_options(page, _SELECT_IDS["bunji"])
-                if jibun in bunji_options:
-                    page.select_option(f"#{_SELECT_IDS['bunji']}", label=jibun)
-                    logger.info("✅ 번지 선택: %s", jibun)
-                elif len(bunji_options) > 1:
-                    page.select_option(f"#{_SELECT_IDS['bunji']}", index=1)
-                    logger.info(
-                        "✅ 번지 선택: 첫 번째 항목 (%s)",
-                        bunji_options[1] if len(bunji_options) > 1 else "N/A",
-                    )
-                time.sleep(1)
-            except Exception as exc:
-                logger.warning("⚠️ 번지 선택 실패: %s", exc)
-        else:
-            # 번지 미입력 시 첫 번째 유효 항목 자동 선택
-            try:
-                bunji_options = self._get_select_options(page, _SELECT_IDS["bunji"])
-                if len(bunji_options) > 1:
-                    page.select_option(f"#{_SELECT_IDS['bunji']}", index=1)
-                    logger.info("✅ 번지 자동선택: %s", bunji_options[1])
-                    time.sleep(1)
-            except Exception:
-                pass
+        # 번지 선택
+        self._select_bunji(page, jibun)
+
+    def _select_bunji(self, page: Any, jibun: str) -> None:
+        """번지(bunji) select 처리 — 값이 있으면 매칭, 없으면 첫 번째 유효 항목."""
+        bunji_id = _SELECT_IDS["bunji"]
+        try:
+            self._wait_for_select_options(page, bunji_id, timeout_ms=5000)
+            options = self._get_select_options(page, bunji_id)
+
+            if len(options) <= 1:
+                logger.info("ℹ️ 번지 옵션 없음 — 스킵")
+                return
+
+            if jibun and jibun in options:
+                self._set_select_value_robust(page, bunji_id, jibun)
+                logger.info("✅ 번지 선택: '%s'", jibun)
+            else:
+                # 첫 번째 유효 항목 (보통 index=1이 첫 번지)
+                selected = options[1] if len(options) > 1 else None
+                if selected:
+                    self._set_select_value_robust(page, bunji_id, selected)
+                    logger.info("✅ 번지 자동선택: '%s'", selected)
+                else:
+                    logger.info("ℹ️ 번지 자동선택 불가 — 유효 옵션 없음")
+            time.sleep(0.5)
+        except Exception as exc:
+            logger.warning("⚠️ 번지 선택 실패: %s", exc)
+
+    @staticmethod
+    def _find_best_option(value: str, options: list[str]) -> str | None:
+        """옵션 리스트에서 최적 매칭을 찾는다.
+
+        우선순위: 정확매칭 > 포함매칭(value in option) > 포함매칭(option in value)
+        """
+        # 빈 값 제거
+        valid = [o for o in options if o.strip()]
+        if not valid:
+            return None
+
+        # 1) 정확 매칭
+        if value in valid:
+            return value
+
+        # 2) 포함 매칭 (value가 option에 포함)
+        for opt in valid:
+            if value in opt:
+                return opt
+
+        # 3) 역방향 포함 매칭 (option이 value에 포함)
+        for opt in valid:
+            if opt in value:
+                return opt
+
+        return None
+
+    @staticmethod
+    def _wait_for_select_options(
+        page: Any,
+        select_id: str,
+        timeout_ms: int = _SELECT_OPTION_TIMEOUT_MS,
+    ) -> None:
+        """특정 select 요소의 옵션이 1개 이상 로드될 때까지 대기."""
+        try:
+            page.wait_for_function(
+                f"""() => {{
+                    const sel = document.getElementById('{select_id}');
+                    return sel && sel.options.length > 1;
+                }}""",
+                timeout=timeout_ms,
+            )
+        except Exception:
+            # 타임아웃이어도 계속 진행 (옵션이 아예 없는 select일 수 있음)
+            pass
 
     @staticmethod
     def _get_select_options(page: Any, select_id: str) -> list[str]:
@@ -395,65 +824,222 @@ class KepcoOnlineScraper:
         }}""")
 
     @staticmethod
-    def _click_search(page: Any) -> None:
-        """검색 버튼을 클릭하고 결과를 대기."""
-        search_btn = page.query_selector(f"#{_SEARCH_BTN_ID}")
-        if not search_btn:
-            raise ScraperError("검색 버튼을 찾을 수 없습니다.")
+    def _set_select_value_robust(page: Any, select_id: str, label: str) -> bool:
+        """WebSquare 호환 select 값 설정.
 
-        logger.info("🔍 검색 버튼 클릭")
-        search_btn.click()
+        1차: $w.getComponentById API (WebSquare 네이티브)
+        2차: page.select_option (Playwright native select)
+        3차: JavaScript로 직접 selectedIndex + change event dispatch
 
-        # 결과 데이터가 DOM에 채워질 때까지 대기
-        # 참고: wframe01은 display:none 상태일 수 있지만 데이터는 DOM에 주입됨
+        Args:
+            page: Playwright Page 객체
+            select_id: native select 요소 ID (예: mf_wfm_layout_sbx_sido_input_0)
+            label: 선택할 옵션 텍스트
+
+        Returns:
+            선택 성공 여부
+        """
+        # WebSquare 컴포넌트 ID 추출: "mf_" 접두어 및 "_input_0" 접미어 제거
+        comp_id = select_id
+        if comp_id.startswith("mf_"):
+            comp_id = comp_id[3:]
+        if comp_id.endswith("_input_0"):
+            comp_id = comp_id[:-8]
+
+        # Attempt 1: WebSquare $w API
         try:
-            page.wait_for_function(
-                f"""() => {{
-                    const el = document.getElementById('{_RESULT_IDS["dl_nm"]}');
-                    return el && el.textContent.trim().length > 0;
-                }}""",
-                timeout=int(_SEARCH_WAIT_SECONDS * 1000),
+            result = page.evaluate(
+                f"""(label) => {{
+                try {{
+                    var comp = $w.getComponentById('{comp_id}');
+                    if (comp) {{
+                        // getItemCount + getItemText + setSelectedIndex
+                        var count = comp.getItemCount ? comp.getItemCount() : 0;
+                        for (var i = 0; i < count; i++) {{
+                            var text = comp.getItemText ? comp.getItemText(i) : '';
+                            if (text === label || text.indexOf(label) >= 0 || label.indexOf(text) >= 0) {{
+                                comp.setSelectedIndex(i);
+                                return 'ws_api';
+                            }}
+                        }}
+                        // direct setValue 폴백
+                        if (comp.setValue) {{
+                            comp.setValue(label);
+                            return 'ws_setValue';
+                        }}
+                    }}
+                }} catch(e) {{}}
+                return '';
+            }}""",
+                label,
             )
-            logger.info("✅ 결과 데이터 로드 감지됨")
+            if result:
+                logger.info(
+                    "✅ WebSquare API로 선택: %s = '%s' (method=%s)",
+                    select_id,
+                    label,
+                    result,
+                )
+                time.sleep(0.3)
+                return True
         except Exception:
-            logger.warning("⏰ 결과 데이터 대기 시간 초과 (%.0fs)", _SEARCH_WAIT_SECONDS)
+            pass
 
-        # 추가 대기 (데이터 렌더링 완료)
-        time.sleep(2)
+        # Attempt 2: Playwright native page.select_option
+        try:
+            page.select_option(f"#{select_id}", label=label)
+            logger.info("✅ Native select_option으로 선택: %s = '%s'", select_id, label)
+            time.sleep(0.3)
+            return True
+        except Exception:
+            pass
+
+        # Attempt 3: JavaScript selectedIndex + change event dispatch
+        try:
+            result = page.evaluate(
+                f"""(label) => {{
+                var sel = document.getElementById('{select_id}');
+                if (!sel) return false;
+                for (var i = 0; i < sel.options.length; i++) {{
+                    if (sel.options[i].text === label || sel.options[i].text.indexOf(label) >= 0) {{
+                        sel.selectedIndex = i;
+                        sel.dispatchEvent(new Event('change', {{bubbles: true}}));
+                        return true;
+                    }}
+                }}
+                return false;
+            }}""",
+                label,
+            )
+            if result:
+                logger.info("✅ JS dispatchEvent로 선택: %s = '%s'", select_id, label)
+                time.sleep(0.3)
+                return True
+        except Exception:
+            pass
+
+        logger.warning("❌ 모든 select 설정 방법 실패: %s = '%s'", select_id, label)
+        return False
 
     @staticmethod
-    def _parse_results(page: Any) -> list[CapacityRecord]:
-        """결과 프레임(wframe01) DOM에서 용량 데이터를 추출하여 CapacityRecord로 변환."""
+    def _click_search_button(page: Any) -> None:
+        """검색 버튼을 클릭한다."""
+        # 방법 1: ID로 직접 클릭
+        search_btn = page.query_selector(f"#{_SEARCH_BTN_ID}")
+        if search_btn:
+            search_btn.click()
+            return
+
+        # 방법 2: evaluate로 클릭 이벤트 발생
+        page.evaluate(f"""() => {{
+            const btn = document.getElementById('{_SEARCH_BTN_ID}');
+            if (btn) {{
+                btn.click();
+                return true;
+            }}
+            // 폴백: 텍스트로 찾기
+            const buttons = document.querySelectorAll('button, a[role="button"], div[role="button"]');
+            for (const b of buttons) {{
+                if (b.textContent.includes('검색')) {{
+                    b.click();
+                    return true;
+                }}
+            }}
+            return false;
+        }}""")
+
+    def _wait_for_results(self, page: Any) -> bool:
+        """검색 결과가 DOM에 나타날 때까지 대기. 성공하면 True.
+
+        1차: wait_for_function으로 결과 필드 감지 (최대 _SEARCH_RESULT_TIMEOUT_MS)
+        2차: 폴백 — 수동 DOM 폴링 (1초 간격, 최대 10회)
+        """
+        check_ids = [
+            _RESULT_IDS["dl_nm"],
+            _RESULT_IDS["subst_nm"],
+            _RESULT_IDS["vol1_1"],
+            _RESULT_IDS["vol3_1"],
+        ]
+        ids_json = json.dumps(check_ids)
+
+        # Attempt 1: Playwright wait_for_function
+        try:
+            page.wait_for_function(
+                """(ids) => {
+                    return ids.some(id => {
+                        const el = document.getElementById(id);
+                        return el && el.textContent.trim().length > 0;
+                    });
+                }""",
+                ids_json,
+                timeout=_SEARCH_RESULT_TIMEOUT_MS,
+            )
+            logger.info("✅ 결과 데이터 로드 감지됨 (wait_for_function)")
+            time.sleep(1)  # 나머지 필드 렌더링 대기
+            return True
+        except Exception:
+            logger.info("⏰ wait_for_function 타임아웃, DOM 폴링 폴백 시도...")
+
+        # Attempt 2: 수동 DOM 폴링 폴백
+        max_polls = 10
+        for poll in range(1, max_polls + 1):
+            time.sleep(1)
+            try:
+                found = page.evaluate(
+                    """(ids) => {
+                        return ids.some(id => {
+                            const el = document.getElementById(id);
+                            return el && el.textContent.trim().length > 0;
+                        });
+                    }""",
+                    check_ids,
+                )
+                if found:
+                    logger.info("✅ 결과 데이터 로드 감지됨 (DOM 폴링 %d/%d)", poll, max_polls)
+                    time.sleep(0.5)
+                    return True
+            except Exception:
+                pass
+            logger.debug("⏳ DOM 폴링 %d/%d: 결과 미감지", poll, max_polls)
+
+        return False
+
+    # ===================================================================
+    # DOM 파싱 (L1, L2 공통)
+    # ===================================================================
+
+    @staticmethod
+    def _parse_dom_results(page: Any) -> list[CapacityRecord]:
+        """결과 프레임(wframe01) DOM에서 용량 데이터를 추출하여 CapacityRecord로 변환.
+
+        wframe01이 display:none 상태여도 데이터는 DOM에 주입되어 있다.
+        """
+        result_ids_json = json.dumps(_RESULT_IDS)
+
         raw = page.evaluate(
-            """() => {
-            const result = {};
-            const ids = %s;
-            
-            for (const [key, elId] of Object.entries(ids)) {
+            f"""() => {{
+            const result = {{}};
+            const ids = {result_ids_json};
+            for (const [key, elId] of Object.entries(ids)) {{
                 const el = document.getElementById(elId);
                 result[key] = el ? el.textContent.trim() : '';
-            }
-            
+            }}
             return result;
-        }"""
-            % str({k: v for k, v in _RESULT_IDS.items()}).replace("'", '"')
+        }}"""
         )
 
-        # 참고: wframe01이 display:none이더라도 데이터는 DOM에 주입됨
         subst_nm = raw.get("subst_nm", "")
         mtr_no = raw.get("mtr_no", "")
         dl_nm = raw.get("dl_nm", "")
 
         if not subst_nm and not dl_nm:
-            logger.warning("결과 데이터가 비어있습니다.")
+            logger.warning("결과 데이터가 비어있습니다. raw=%s", raw)
             return []
 
-        # 여유용량 추출 (vol1_1: 접수기준, vol1_2: 접속계획반영)
         vol1 = _clean_number(raw.get("vol1_1", "0"))
         vol2 = _clean_number(raw.get("vol2_1", "0"))
         vol3 = _clean_number(raw.get("vol3_1", "0"))
 
-        # 용량 정보
         js_subst_pwr = _clean_number(raw.get("subst_capa", "0"))
         subst_pwr = _clean_number(raw.get("subst_pwr", "0"))
         js_mtr_pwr = _clean_number(raw.get("mtr_capa", "0"))
@@ -488,60 +1074,5 @@ class KepcoOnlineScraper:
 
         return [record]
 
-    def _launch_browser(self, pw: Any) -> Any:
-        """Playwright 브라우저 인스턴스 실행 (3단계 폴백)."""
-        browser_type_name = self._options.browser_type.lower()
-
-        if browser_type_name == "firefox":
-            launcher = pw.firefox
-        elif browser_type_name == "webkit":
-            launcher = pw.webkit
-        else:
-            launcher = pw.chromium
-
-        launch_args = (
-            [
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
-            ]
-            if browser_type_name == "chromium"
-            else []
-        )
-
-        # 1차: Playwright 관리 바이너리
-        try:
-            return launcher.launch(
-                headless=self._options.headless,
-                args=launch_args,
-            )
-        except Exception as first_err:
-            logger.warning("⚠️ Playwright 바이너리 실패: %s", str(first_err)[:200])
-
-        # 2차: 자동 설치 후 재시도
-        _ensure_playwright_browsers()
-        try:
-            return launcher.launch(
-                headless=self._options.headless,
-                args=launch_args,
-            )
-        except Exception as second_err:
-            logger.warning("⚠️ 자동설치 후 실패: %s", str(second_err)[:200])
-
-        # 3차: 시스템 chromium 폴백
-        system_chromium = _find_system_chromium()
-        if system_chromium and browser_type_name == "chromium":
-            try:
-                return launcher.launch(
-                    headless=self._options.headless,
-                    executable_path=system_chromium,
-                    args=launch_args,
-                )
-            except Exception as third_err:
-                raise ScraperError(
-                    f"Playwright 브라우저 실행 실패 (3단계 모두 실패): {third_err}"
-                ) from third_err
-
-        raise ScraperError(
-            "Playwright 브라우저를 실행할 수 없습니다.\n해결: `playwright install chromium` 실행"
-        )
+    # _parse_results 는 기존 테스트 호환을 위해 유지
+    _parse_results = _parse_dom_results

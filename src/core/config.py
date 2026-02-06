@@ -115,10 +115,12 @@ class Settings:
         default_factory=lambda: _get_float("KEPCO_API_DELAY_SECONDS", 0.0)
     )
 
+    # 기존 home.kepco.co.kr은 보강공사 현황만 표시 — 여유용량 데이터 없음
+    # online.kepco.co.kr/EWM092D00이 실제 용량조회 페이지
     kepco_on_capacity_url: str = field(
         default_factory=lambda: _get_str(
             "KEPCO_ON_CAPACITY_URL",
-            "https://home.kepco.co.kr/kepco/CO/H/E/COHEPP001/COHEPP00110.do?menuCd=FN420106",
+            "https://online.kepco.co.kr/EWM092D00",
         )
     )
 
@@ -152,8 +154,8 @@ class Settings:
     playwright_browser_type: str = field(
         default_factory=lambda: _get_str("PLAYWRIGHT_BROWSER_TYPE", "chromium")
     )
-    # 스크래퍼 엔진 우선순위: "playwright" (기본) 또는 "selenium"
-    scraper_engine: str = field(default_factory=lambda: _get_str("SCRAPER_ENGINE", "playwright"))
+    # 스크래퍼 엔진 (호환성 유지, 현재는 online→playwright→selenium 고정 폴백)
+    scraper_engine: str = field(default_factory=lambda: _get_str("SCRAPER_ENGINE", "online"))
 
     capacity_threshold_green: int = 3000
     capacity_threshold_yellow: int = 1000
