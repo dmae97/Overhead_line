@@ -24,7 +24,16 @@ class PlaywrightOptions:
     """Playwright 스크래퍼 실행 옵션 (호환성 유지)."""
 
     def __init__(self, **kwargs: Any) -> None:
-        pass
+        # 과거 옵션 객체를 넘기던 코드와의 호환을 위해 kwargs를 그대로 보관한다.
+        # (현재 래퍼 구현에서는 실질적으로 사용하지 않지만, 외부에서 속성 접근을
+        # 기대할 수 있으므로 동적으로 attribute를 설정한다.)
+        self._raw: dict[str, Any] = dict(kwargs)
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+    def to_dict(self) -> dict[str, Any]:
+        """원본 옵션을 dict로 반환."""
+        return dict(self._raw)
 
 
 def _parse_keyword_to_region(keyword: str) -> dict[str, str]:
@@ -73,9 +82,10 @@ def _parse_keyword_to_region(keyword: str) -> dict[str, str]:
 
     if len(parts) >= 4:
         token = parts[3]
-        if any(token.endswith(s) for s in ["읍", "면", "동", "리", "로", "길"]) or not result[
-            "dong"
-        ]:
+        if (
+            any(token.endswith(s) for s in ["읍", "면", "동", "리", "로", "길"])
+            or not result["dong"]
+        ):
             result["dong"] = token
         else:
             result["jibun"] = token

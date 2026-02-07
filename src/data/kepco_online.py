@@ -905,7 +905,12 @@ class KepcoOnlineScraper:
                 time.sleep(0.3)
                 return True
         except Exception:
-            pass
+            logger.debug(
+                "WebSquare API select 설정 실패: %s = '%s'",
+                select_id,
+                label,
+                exc_info=True,
+            )
 
         # Attempt 2: Playwright native page.select_option
         try:
@@ -914,7 +919,12 @@ class KepcoOnlineScraper:
             time.sleep(0.3)
             return True
         except Exception:
-            pass
+            logger.debug(
+                "Native select_option 실패: %s = '%s'",
+                select_id,
+                label,
+                exc_info=True,
+            )
 
         # Attempt 3: JavaScript selectedIndex + change event dispatch
         try:
@@ -938,7 +948,12 @@ class KepcoOnlineScraper:
                 time.sleep(0.3)
                 return True
         except Exception:
-            pass
+            logger.debug(
+                "JS dispatchEvent select 설정 실패: %s = '%s'",
+                select_id,
+                label,
+                exc_info=True,
+            )
 
         logger.warning("❌ 모든 select 설정 방법 실패: %s = '%s'", select_id, label)
         return False
@@ -1022,8 +1037,13 @@ class KepcoOnlineScraper:
                     logger.info("✅ 결과 데이터 로드 감지됨 (DOM 폴링 %d/%d)", poll, max_polls)
                     time.sleep(0.5)
                     return True
-            except Exception:
-                pass
+            except Exception as exc:
+                # 반복 호출되는 구간이라 과도한 traceback 로그는 피한다.
+                # (첫 실패는 원인 파악을 위해 traceback 포함)
+                if poll == 1:
+                    logger.debug("DOM 폴링 evaluate 실패(최초): %s", exc, exc_info=True)
+                else:
+                    logger.debug("DOM 폴링 evaluate 실패: %s", exc)
             logger.debug("⏳ DOM 폴링 %d/%d: 결과 미감지", poll, max_polls)
 
         return False

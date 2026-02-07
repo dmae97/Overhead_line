@@ -135,6 +135,12 @@ def _fetch_online_with_cache(
             if isinstance(ts, (int, float)) and (now - float(ts)) < min_interval_seconds and recs:
                 remaining = int(min_interval_seconds - (now - float(ts)))
                 st.sidebar.info(f"최근 조회 결과를 사용합니다. 다음 갱신까지 {remaining}s")
+                st.session_state["_timer_state"] = {
+                    "last_ts": float(ts),
+                    "next_ts": float(ts) + min_interval_seconds,
+                    "label": str(label or region.display_name),
+                    "auto_reload": False,
+                }
                 return recs, str(label or region.display_name)
 
         with st.spinner(f"🌐 한전ON에서 {region.display_name} 여유용량 조회 중..."):
@@ -149,6 +155,12 @@ def _fetch_online_with_cache(
             "ts": now,
             "records": records,
             "label": region.display_name,
+        }
+        st.session_state["_timer_state"] = {
+            "last_ts": float(now),
+            "next_ts": float(now) + min_interval_seconds,
+            "label": f"{region.display_name} (한전ON)",
+            "auto_reload": False,
         }
         return records, f"{region.display_name} (한전ON)"
 
@@ -192,9 +204,15 @@ def _render_query_sidebar() -> tuple[list[CapacityRecord] | None, str]:
         max_value=60,
         value=15,
         step=5,
-        help="너무 잦은 조회는 CAPTCHA/봇탐지 또는 접속 제한을 유발할 수 있습니다.",
+        help=(
+            "너무 잦은 조회는 CAPTCHA/봇탐지 또는 접속 제한을 유발할 수 있습니다. "
+            "브라우저(한전ON) 조회 모드에서는 10~15분 이상을 권장합니다."
+        ),
     )
 
+    # OpenAPI는 상대적으로 안정적이지만, 한전ON 브라우저 조회는 자동화 탐지에 더 민감하다.
+    recommended_browser_minutes = 15
+    effective_browser_minutes = max(int(refresh_minutes), recommended_browser_minutes)
     min_interval_seconds = float(refresh_minutes) * 60.0
 
     auto_reload = st.sidebar.checkbox(
@@ -233,6 +251,13 @@ def _render_query_sidebar() -> tuple[list[CapacityRecord] | None, str]:
 
     # API 키가 없으면 한전ON(EWM092D00) 브라우저 스크래퍼로 폴백
     if not settings.kepco_api_key:
+        st.sidebar.warning(
+            "⚠️ 한전ON 브라우저 조회는 CAPTCHA/봇탐지에 민감합니다.\n\n"
+            f"- 같은 지역 반복 조회는 **{recommended_browser_minutes}분 이상 간격** 권장\n"
+            "- 여러 탭/여러 PC에서 동시에 반복 조회하지 마세요\n"
+            "- 가능하면 OpenAPI(무료 API 키) 모드 사용을 권장합니다"
+        )
+
         if region.dong == "전체":
             st.sidebar.warning(
                 "⚠️ KEPCO_API_KEY 미설정 상태에서는 읍/면/동 '전체' 조회를 지원하지 않습니다. "
@@ -240,7 +265,15 @@ def _render_query_sidebar() -> tuple[list[CapacityRecord] | None, str]:
             )
             return None, ""
         st.sidebar.warning("⚠️ KEPCO_API_KEY 미설정 → 한전ON 브라우저 조회 모드")
-        return _fetch_online_with_cache(region, jibun, min_interval_seconds)
+
+        if effective_browser_minutes != int(refresh_minutes):
+            msg = (
+                "봇탐지 예방을 위해 브라우저 모드 최소 간격을 "
+                f"{effective_browser_minutes}분으로 적용합니다."
+            )
+            st.sidebar.info(msg)
+        browser_min_interval_seconds = float(effective_browser_minutes) * 60.0
+        return _fetch_online_with_cache(region, jibun, browser_min_interval_seconds)
 
     if region.dong == "전체":
         st.sidebar.info(
@@ -249,8 +282,7 @@ def _render_query_sidebar() -> tuple[list[CapacityRecord] | None, str]:
         )
         if jibun:
             st.sidebar.warning(
-                "읍/면/동 '전체' 조회에서는 지번을 사용할 수 없습니다. "
-                "지번은 무시하고 조회합니다."
+                "읍/면/동 '전체' 조회에서는 지번을 사용할 수 없습니다. 지번은 무시하고 조회합니다."
             )
             jibun = ""
 
