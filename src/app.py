@@ -224,6 +224,7 @@ def _fetch_online_with_cache(
                 sido=region.sido,
                 sigungu=region.sigungu,
                 dong=region.dong if region.dong != "전체" else "",
+                ri=region.ri,
                 jibun=jibun,
             )
 

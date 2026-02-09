@@ -63,6 +63,7 @@ def _run_kepco_online(
     sido: str = "",
     sigungu: str = "",
     dong: str = "",
+    li: str = "",
     jibun: str = "",
 ) -> list[CapacityRecord]:
     """한전ON EWM092D00 (online.kepco.co.kr) Playwright 엔진으로 용량 조회.
@@ -77,6 +78,7 @@ def _run_kepco_online(
             sido=sido,
             sigungu=sigungu,
             dong=dong,
+            li=li,
             jibun=jibun,
         )
     # keyword-only: parse into components
@@ -224,6 +226,7 @@ def fetch_capacity_by_online(
     sido: str,
     sigungu: str,
     dong: str = "",
+    ri: str = "",
     jibun: str = "",
 ) -> list[CapacityRecord]:
     """한전ON(EWM092D00) Playwright 스크래퍼로 직접 용량 조회.
@@ -259,6 +262,7 @@ def fetch_capacity_by_online(
                 sido=sido,
                 sigungu=sigungu,
                 dong=dong,
+                li=ri,
                 jibun=jibun,
             )
             logger.info("✅ [kepco_online] 조회 성공 — %d건 반환", len(records))

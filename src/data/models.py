@@ -113,6 +113,7 @@ class RegionInfo(BaseModel):
     sido: str = Field(description="시도명")
     sigungu: str = Field(description="시군구명")
     dong: str = Field(default="전체", description="읍면동명")
+    ri: str = Field(default="", description="리명(선택)")
 
     @property
     def display_name(self) -> str:
@@ -120,6 +121,8 @@ class RegionInfo(BaseModel):
         parts = [self.sido, self.sigungu]
         if self.dong and self.dong != "전체":
             parts.append(self.dong)
+        if self.ri and self.ri != "전체" and self.dong and self.dong != "전체":
+            parts.append(self.ri)
         return " ".join(parts)
 
 

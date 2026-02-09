@@ -8,7 +8,7 @@ import pandas as pd
 import pytest
 
 from src.core.exceptions import AddressDataError
-from src.data.address import to_kepco_params
+from src.data.address import get_ri_list, to_kepco_params
 from src.data.models import RegionInfo
 
 
@@ -21,6 +21,8 @@ def _mock_bdong_df() -> pd.DataFrame:
                 "시도명": "충청남도",
                 "시군구코드": "44131",
                 "시군구명": "천안시 동남구",
+                "읍면동명": "광덕면",
+                "동리명": "상서리",
                 "말소일자": "",
             },
             # 세종시는 시군구명이 비어있는 케이스를 처리한다.
@@ -29,6 +31,8 @@ def _mock_bdong_df() -> pd.DataFrame:
                 "시도명": "세종특별자치시",
                 "시군구코드": "36110",
                 "시군구명": "",
+                "읍면동명": "조치원읍",
+                "동리명": "",
                 "말소일자": "",
             },
         ]
@@ -39,11 +43,12 @@ def test_to_kepco_params_normal_region() -> None:
     df = _mock_bdong_df()
     with patch("src.data.address.load_bdong_codes", return_value=df):
         params = to_kepco_params(
-            RegionInfo(sido="충청남도", sigungu="천안시 동남구", dong="광덕면")
+            RegionInfo(sido="충청남도", sigungu="천안시 동남구", dong="광덕면", ri="상서리")
         )
         assert params.metro_cd == "44"
         assert params.city_cd == "131"
         assert params.dong == "광덕면"
+        assert params.ri == "상서리"
 
 
 def test_to_kepco_params_all_dong_to_empty() -> None:
@@ -64,9 +69,59 @@ def test_to_kepco_params_sigungu_missing_case_sejong() -> None:
         assert params.dong == "조치원읍"
 
 
+def test_get_ri_list_returns_sorted_unique() -> None:
+    df = pd.DataFrame(
+        [
+            {
+                "시도명": "충청남도",
+                "시군구명": "천안시 동남구",
+                "읍면동명": "광덕면",
+                "동리명": "하서리",
+            },
+            {
+                "시도명": "충청남도",
+                "시군구명": "천안시 동남구",
+                "읍면동명": "광덕면",
+                "동리명": "상서리",
+            },
+            {
+                "시도명": "충청남도",
+                "시군구명": "천안시 동남구",
+                "읍면동명": "광덕면",
+                "동리명": "",
+            },
+        ]
+    )
+    with patch("src.data.address.load_bdong_codes", return_value=df):
+        assert get_ri_list("충청남도", "천안시 동남구", "광덕면") == ["상서리", "하서리"]
+        assert get_ri_list("충청남도", "천안시 동남구", "전체") == []
+
+
+def test_get_ri_list_sejong_sigungu_missing_case() -> None:
+    df = pd.DataFrame(
+        [
+            {
+                "시도명": "세종특별자치시",
+                "시군구명": "",
+                "읍면동명": "조치원읍",
+                "동리명": "상서리",
+            },
+            {
+                "시도명": "세종특별자치시",
+                "시군구명": "",
+                "읍면동명": "조치원읍",
+                "동리명": "하서리",
+            },
+        ]
+    )
+    with patch("src.data.address.load_bdong_codes", return_value=df):
+        assert get_ri_list("세종특별자치시", "세종특별자치시", "조치원읍") == ["상서리", "하서리"]
+
+
 def test_to_kepco_params_missing_region_raises() -> None:
     df = _mock_bdong_df()
-    with patch("src.data.address.load_bdong_codes", return_value=df), pytest.raises(
-        AddressDataError
+    with (
+        patch("src.data.address.load_bdong_codes", return_value=df),
+        pytest.raises(AddressDataError),
     ):
         to_kepco_params(RegionInfo(sido="없는시도", sigungu="없는시군구", dong="전체"))

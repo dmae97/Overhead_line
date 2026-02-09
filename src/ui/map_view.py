@@ -37,6 +37,19 @@ class _PointInfo(TypedDict):
     hover: str
 
 
+def _map_capacity_color(capacity_kw: int) -> str:
+    """지도에서 쓰는 용량 색상.
+
+    - 시안성 개선: 노랑(#ffc107)은 지도에서 잘 안 보여서 주황(#fd7e14)으로 합친다.
+    - 그 외는 기존 capacity_color를 유지한다.
+    """
+
+    base = capacity_color(capacity_kw)
+    if base == "#ffc107":
+        return "#fd7e14"
+    return base
+
+
 def _build_schematic_points_and_segments(
     records: list[CapacityRecord],
     base_lat: float,
@@ -45,6 +58,9 @@ def _build_schematic_points_and_segments(
 ) -> tuple[
     dict[tuple[str, str], list[CapacityRecord]],
     dict[str, _PointInfo],
+    dict[tuple[str, str], _PointInfo],
+    dict[str, _PointInfo],
+    dict[str, list[float | None]],
     dict[str, dict[str, list[float | None]]],
 ]:
     """좌표 없는 레코드에서 스키매틱 점/연결선을 생성한다.
@@ -58,59 +74,108 @@ def _build_schematic_points_and_segments(
         mtr_key = (r.mtr_no or "").strip() or "(unknown-mtr)"
         grouped[(subst_key, mtr_key)].append(r)
 
-    points: dict[str, _PointInfo] = {}
+    subst_points: dict[str, _PointInfo] = {}
+    mtr_points: dict[tuple[str, str], _PointInfo] = {}
+    dl_points: dict[str, _PointInfo] = {}
 
-    for (subst_key, mtr_key), items in grouped.items():
-        group_center_key = f"{base_lat:.4f}:{base_lon:.4f}:{subst_key}:{mtr_key}"
-        g_lat, g_lon = _jitter_point(base_lat, base_lon, group_center_key, radius_deg=float(spread))
-
-        for r in items:
-            dl_key = (r.dl_cd or r.dl_nm or "").strip() or "(unknown-dl)"
-            point_key = f"{subst_key}:{mtr_key}:{dl_key}"
-            lat, lon = _jitter_point(g_lat, g_lon, point_key, radius_deg=float(spread) * 0.45)
-            cap = int(r.min_capacity)
-            points[point_key] = {
-                "lat": float(lat),
-                "lon": float(lon),
-                "cap": cap,
-                "color": capacity_color(cap),
-                "hover": "<br>".join(
-                    [
-                        f"<b>{dl_key}</b>",
-                        f"substation: {subst_key}",
-                        f"transformer: {mtr_key}",
-                        f"min_capacity: {cap:,} kW",
-                    ]
-                ),
-            }
-
-    segments_by_color: dict[str, dict[str, list[float | None]]] = {
+    seg_sub_mtr: dict[str, list[float | None]] = {"lat": [], "lon": []}
+    seg_mtr_dl_by_color: dict[str, dict[str, list[float | None]]] = {
         "#28a745": {"lat": [], "lon": []},
-        "#ffc107": {"lat": [], "lon": []},
         "#fd7e14": {"lat": [], "lon": []},
         "#dc3545": {"lat": [], "lon": []},
     }
 
-    for (subst_key, mtr_key), items in grouped.items():
-        items_sorted = sorted(items, key=lambda x: x.min_capacity, reverse=True)
-        keys = [
-            f"{subst_key}:{mtr_key}:{((x.dl_cd or x.dl_nm or '').strip() or '(unknown-dl)')}"
-            for x in items_sorted
-        ]
-        for a, b in zip(keys, keys[1:], strict=False):
-            pa = points.get(a)
-            pb = points.get(b)
-            if not pa or not pb:
-                continue
-            cap = min(pa["cap"], pb["cap"])
-            color = capacity_color(cap)
-            bucket = segments_by_color.get(color)
-            if bucket is None:
-                continue
-            bucket["lat"].extend([pa["lat"], pb["lat"], None])
-            bucket["lon"].extend([pa["lon"], pb["lon"], None])
+    # 변전소(수전) 중심점
+    subst_centers: dict[str, tuple[float, float]] = {}
 
-    return grouped, points, segments_by_color
+    for subst_key in sorted({k[0] for k in grouped}):
+        sub_lat, sub_lon = _jitter_point(
+            base_lat,
+            base_lon,
+            f"sub:{base_lat:.4f}:{base_lon:.4f}:{subst_key}",
+            radius_deg=float(spread),
+        )
+        # 변전소 용량(최소)
+        subst_records = [r for (s, _), rows in grouped.items() if s == subst_key for r in rows]
+        subst_cap = min((r.substation_capacity for r in subst_records), default=0)
+        subst_centers[subst_key] = (float(sub_lat), float(sub_lon))
+        subst_points[subst_key] = {
+            "lat": float(sub_lat),
+            "lon": float(sub_lon),
+            "cap": int(subst_cap),
+            "color": "#111827",
+            "hover": "<br>".join(
+                [
+                    f"<b>수전(변전소)</b>: {subst_key}",
+                    f"substation_capacity: {int(subst_cap):,} kW",
+                ]
+            ),
+        }
+
+    # 변압기/ DL 포인트 + 연결선
+    for (subst_key, mtr_key), items in grouped.items():
+        sub_center = subst_centers.get(subst_key, (base_lat, base_lon))
+        m_lat, m_lon = _jitter_point(
+            sub_center[0],
+            sub_center[1],
+            f"mtr:{subst_key}:{mtr_key}",
+            radius_deg=float(spread) * 0.55,
+        )
+        mtr_cap = min((r.transformer_capacity for r in items), default=0)
+        mtr_min = min((r.min_capacity for r in items), default=0)
+        mtr_points[(subst_key, mtr_key)] = {
+            "lat": float(m_lat),
+            "lon": float(m_lon),
+            "cap": int(mtr_min),
+            "color": "#334155",
+            "hover": "<br>".join(
+                [
+                    f"<b>변압기</b>: {mtr_key}",
+                    f"substation: {subst_key}",
+                    f"transformer_capacity: {int(mtr_cap):,} kW",
+                    f"min_capacity(group): {int(mtr_min):,} kW",
+                ]
+            ),
+        }
+
+        # 수전 -> 변압기 연결(중립선)
+        sub_lat, sub_lon = subst_centers.get(subst_key, (base_lat, base_lon))
+        seg_sub_mtr["lat"].extend([float(sub_lat), float(m_lat), None])
+        seg_sub_mtr["lon"].extend([float(sub_lon), float(m_lon), None])
+
+        for r in items:
+            dl_key = (r.dl_cd or r.dl_nm or "").strip() or "(unknown-dl)"
+            point_key = f"{subst_key}:{mtr_key}:{dl_key}"
+            d_lat, d_lon = _jitter_point(
+                float(m_lat),
+                float(m_lon),
+                f"dl:{subst_key}:{mtr_key}:{dl_key}",
+                radius_deg=float(spread) * 0.28,
+            )
+            cap = int(r.min_capacity)
+            color = _map_capacity_color(cap)
+            dl_points[point_key] = {
+                "lat": float(d_lat),
+                "lon": float(d_lon),
+                "cap": cap,
+                "color": color,
+                "hover": "<br>".join(
+                    [
+                        f"<b>{dl_key}</b>",
+                        f"최소 여유: {cap:,} kW",
+                    ]
+                ),
+            }
+
+            bucket = seg_mtr_dl_by_color.get(color)
+            if bucket is None:
+                # 혹시 다른 색이 생겨도 안전하게 처리
+                seg_mtr_dl_by_color[color] = {"lat": [], "lon": []}
+                bucket = seg_mtr_dl_by_color[color]
+            bucket["lat"].extend([float(m_lat), float(d_lat), None])
+            bucket["lon"].extend([float(m_lon), float(d_lon), None])
+
+    return grouped, subst_points, mtr_points, dl_points, seg_sub_mtr, seg_mtr_dl_by_color
 
 
 # 시/도 중심점 (lat, lon) — 근사치
@@ -249,7 +314,12 @@ def render_korea_query_map(rows: list[QueryHistoryRecord]) -> None:
             lat=lats,
             lon=lons,
             mode="markers",
-            marker=dict(size=sizes, color=colors, opacity=0.85),
+            marker=dict(
+                size=sizes,
+                color=colors,
+                opacity=0.9,
+                line=dict(width=1.0, color="rgba(15,23,42,0.55)"),
+            ),
             hoverinfo="text",
             text=hover,
         )
@@ -263,6 +333,7 @@ def render_korea_query_map(rows: list[QueryHistoryRecord]) -> None:
             center=dict(lat=36.4, lon=127.8),
             zoom=float(zoom),
         ),
+        uirevision="query-map",
     )
 
     st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True})
@@ -291,118 +362,175 @@ def render_capacity_connection_map(
     records: list[CapacityRecord],
     region: RegionInfo | None,
 ) -> None:
-    """현재 조회된 선로 레코드를 지도 위에 근사 배치하고 연결한다.
+    """현재 조회된 선로를 지도에 '근사'로 배치해 용량/연결을 보여준다.
 
-    - 실제 지리 경로가 아니라, 지역 중심점 주변에 DL들을 배치한 스키매틱 뷰다.
-    - 변전소/변압기 그룹 내에서 DL을 용량(최소 여유) 기준으로 정렬해 연결선으로 잇는다.
+    KEPCO 응답에는 선로 geometry가 없어서, 변전소→변압기→DL 구조를 기반으로
+    지오코딩 중심점 주변에 스키매틱(임의 분산) 형태로 배치한다.
     """
 
-    st.subheader("🧭 현재 선로 지도(근사) + 용량 연결")
+    st.subheader("🗺️ 선로 지도(근사) · 용량/연결")
     if not records:
         st.info("표시할 선로 데이터가 없습니다.")
         return
 
-    if region is None:
-        st.warning("지역 정보가 없어 지도 중심을 기본값으로 표시합니다.")
-
-    base_coord = _SIDO_CENTROIDS.get(region.sido) if region else None
-    base_lat, base_lon = base_coord if base_coord else (36.4, 127.8)
-
+    # 지도 배경(Osm) 자체 아이콘(주황 삼각형)은 '봉우리/산' 표식일 수 있다.
     st.caption(
-        "주의: KEPCO 데이터에는 선로 좌표/경로가 없어, 지도 상 연결은 근사(스키매틱)입니다. "
-        "아래의 '공개 전력선 레이어(OSM)'는 OpenStreetMap 기반이며, "
-        "커버리지는 지역별로 다를 수 있습니다."
+        "배경지도에 보이는 작은 주황 삼각형은 OSM 지형 아이콘일 수 있습니다. "
+        "이 화면에서 수전/변압기/DL은 검은 마커/색 원/색 선으로 표시됩니다."
     )
 
-    show_osm = st.checkbox(
-        "공개 전력선 레이어(OSM/무료, 추정)",
-        value=False,
-        help="OSM(power=line/minor_line/cable) 데이터를 Overpass로 가져와 오버레이합니다.",
-    )
-    prefer_distribution = st.checkbox(
-        "배전 느낌(필터 강화)",
-        value=True,
-        disabled=not show_osm,
-        help="minor_line 우선, 낮은 전압 우선으로 정렬하고 과도한 선형은 자동 축소합니다.",
-    )
-    osm_radius_km = st.slider(
-        "OSM 검색 반경(km)",
-        min_value=2,
-        max_value=40,
-        value=12,
-        step=2,
-        disabled=not show_osm,
-    )
-    osm_max_lines = st.slider(
-        "OSM 최대 표시 선 수",
-        min_value=30,
-        max_value=400,
-        value=140,
-        step=10,
-        disabled=not show_osm,
-    )
-    osm_max_kv = st.slider(
-        "OSM 최대 전압(kV)",
-        min_value=11,
-        max_value=345,
-        value=66,
-        step=11,
-        disabled=not show_osm,
-        help=(
-            "배전 위주로 보려면 22~66kV 정도가 무난합니다. "
-            "voltage 태그가 없는 선은 제외하지 않습니다."
-        ),
-    )
+    base_lat, base_lon = 36.4, 127.8
+    if region is not None:
+        query_parts = ["대한민국", region.sido, region.sigungu]
+        if region.dong and region.dong != "전체":
+            query_parts.append(region.dong)
+        if region.ri:
+            query_parts.append(region.ri)
+        geo = geocode_korea_region(" ".join([p for p in query_parts if p]))
+        if geo is not None:
+            base_lat, base_lon = geo
+        else:
+            coord = _SIDO_CENTROIDS.get(region.sido)
+            if coord is not None:
+                base_lat, base_lon = coord
 
-    zoom = st.slider("줌(현재 선로)", min_value=6.0, max_value=13.0, value=10.2, step=0.1)
+    base_style = st.selectbox(
+        "베이스맵",
+        options=["carto-positron", "open-street-map"],
+        index=0,
+        help="carto-positron은 심볼이 적어 시인성이 좋습니다.",
+    )
+    zoom = st.slider("기본 줌", min_value=6.0, max_value=14.0, value=11.0, step=0.1)
     spread = st.slider(
         "점 분산(근사)",
         min_value=0.02,
-        max_value=0.30,
-        value=0.10,
+        max_value=0.25,
+        value=0.08,
         step=0.01,
-        help="선로 좌표가 없어서 임의 분산 배치합니다. 값이 클수록 점/선이 넓게 퍼집니다.",
+        help="geometry가 없어서 임의 분산 배치합니다.",
     )
 
-    # 필터(선로가 많으면 지도/선이 과밀해짐)
+    # OSM 오버레이(무료) 옵션
+    show_osm = st.checkbox(
+        "공개 전력선 레이어(OSM/무료, 추정)",
+        value=False,
+        help="OSM의 power=line/minor_line/cable 선형을 지도에 오버레이합니다.",
+    )
+    prefer_distribution = True
+    osm_radius_km = 12
+    osm_max_lines = 140
+    osm_max_kv = 66
+    if show_osm:
+        with st.expander("OSM 옵션", expanded=True):
+            prefer_distribution = st.checkbox(
+                "배전 느낌(필터 강화)",
+                value=True,
+                help="minor_line 우선 + 낮은 전압 우선 + 자동 다운샘플.",
+            )
+            osm_radius_km = st.slider("검색 반경(km)", 2, 40, 12, 2)
+            osm_max_lines = st.slider("최대 표시 선 수", 30, 400, 140, 10)
+            osm_max_kv = st.slider(
+                "최대 전압(kV)",
+                11,
+                345,
+                66,
+                11,
+                help="배전 위주면 22~66kV 권장. voltage 없는 선은 남겨둡니다.",
+            )
+
+    # 데이터 필터
     subst_options = sorted(
         {(r.subst_nm or r.subst_cd or "").strip() for r in records if r.subst_nm or r.subst_cd}
     )
+    default_subst = subst_options[:1] if len(subst_options) > 1 else subst_options
     selected_subst = st.multiselect(
-        "변전소 필터(옵션)",
+        "변전소 필터(가독성용)",
         options=subst_options,
-        default=subst_options[:3] if len(subst_options) > 3 else subst_options,
-        help="선로 수가 많으면 일부 변전소만 선택해서 보는 것을 권장합니다.",
+        default=default_subst,
+        help="선로가 많으면 일부 변전소만 보는 걸 권장합니다.",
     )
-    filtered = (
+
+    filtered_records = (
         [r for r in records if (r.subst_nm or r.subst_cd or "").strip() in set(selected_subst)]
         if selected_subst
         else records
     )
+    if not filtered_records:
+        st.info("선택한 변전소 범위에 데이터가 없습니다.")
+        return
 
-    # 선로 선택(지도 클릭 이벤트는 Streamlit에서 안정적이지 않아 selectbox로 제공)
-    options: list[tuple[str, CapacityRecord]] = []
-    for r in records:
-        subst_key = (r.subst_nm or r.subst_cd or "").strip() or "(unknown-subst)"
-        mtr_key = (r.mtr_no or "").strip() or "(unknown-mtr)"
-        dl_key = (r.dl_cd or r.dl_nm or "").strip() or "(unknown-dl)"
-        label = f"{subst_key} / {mtr_key} / {dl_key} · {r.min_capacity:,} kW"
-        options.append((label, r))
-    options = sorted(options, key=lambda x: x[0])
+    # 선로 선택(지도 클릭/호버와 동일한 key 사용)
+    option_rows: list[tuple[str, str, CapacityRecord]] = []
+    for r in filtered_records:
+        s = (r.subst_nm or r.subst_cd or "").strip() or "(unknown-subst)"
+        m = (r.mtr_no or "").strip() or "(unknown-mtr)"
+        d = (r.dl_cd or r.dl_nm or "").strip() or "(unknown-dl)"
+        point_key = f"{s}:{m}:{d}"
+        label = f"{s} / {m} / {d} · {r.min_capacity:,} kW"
+        option_rows.append((label, point_key, r))
 
-    selected_record: CapacityRecord = st.selectbox(
-        "선로 선택",
-        options=[x[1] for x in options],
-        format_func=lambda r: next((lab for lab, rr in options if rr == r), "(unknown)"),
+    option_rows = sorted(option_rows, key=lambda x: x[0])
+    key_to_label = {k: lab for lab, k, _ in option_rows}
+    key_to_record = {k: rec for _, k, rec in option_rows}
+    select_keys = [k for _, k, _ in option_rows]
+
+    selected_key = st.selectbox(
+        "선로 선택(지도에서 점 클릭 가능)",
+        options=select_keys,
+        format_func=lambda k: key_to_label.get(str(k), str(k)),
+        key="map_selected_dl_key",
     )
+
+    selected_record = key_to_record.get(str(selected_key))
+    if selected_record is None:
+        selected_record = option_rows[0][2]
 
     selected_subst_key = (
         selected_record.subst_nm or selected_record.subst_cd or ""
     ).strip() or "(unknown-subst)"
     selected_mtr_key = (selected_record.mtr_no or "").strip() or "(unknown-mtr)"
+    selected_dl_key = (
+        selected_record.dl_cd or selected_record.dl_nm or ""
+    ).strip() or "(unknown-dl)"
 
-    grouped, points, segments_by_color = _build_schematic_points_and_segments(
-        records=filtered,
+    edge_scope = st.radio(
+        "연결선 범위",
+        options=["선택한 변압기", "선택한 변전소", "전체"],
+        index=0,
+        horizontal=True,
+    )
+    show_all_points = st.checkbox("포인트 전체 표시", value=False)
+
+    # 그룹핑(하단 표용)
+    grouped_all: dict[tuple[str, str], list[CapacityRecord]] = defaultdict(list)
+    for r in filtered_records:
+        s = (r.subst_nm or r.subst_cd or "").strip() or "(unknown-subst)"
+        m = (r.mtr_no or "").strip() or "(unknown-mtr)"
+        grouped_all[(s, m)].append(r)
+
+    if edge_scope == "선택한 변압기":
+        scope_records = grouped_all.get((selected_subst_key, selected_mtr_key), [])
+    elif edge_scope == "선택한 변전소":
+        scope_records = [
+            r for (s, _), rows in grouped_all.items() if s == selected_subst_key for r in rows
+        ]
+    else:
+        scope_records = filtered_records
+
+    point_records = filtered_records if show_all_points else scope_records
+    if not scope_records:
+        st.info("연결선을 표시할 데이터가 없습니다.")
+        return
+
+    # 포인트는 point_records, 선은 scope_records 기준으로 계산
+    _, sub_pts, mtr_pts, dl_pts, _, _ = _build_schematic_points_and_segments(
+        records=point_records,
+        base_lat=float(base_lat),
+        base_lon=float(base_lon),
+        spread=float(spread),
+    )
+    grouped, sub_e, mtr_e, dl_e, seg_sub_mtr, seg_mtr_dl = _build_schematic_points_and_segments(
+        records=scope_records,
         base_lat=float(base_lat),
         base_lon=float(base_lon),
         spread=float(spread),
@@ -410,28 +538,13 @@ def render_capacity_connection_map(
 
     fig = go.Figure()
 
-    # (선택) OSM 전력선 레이어
+    # OSM 전력선 레이어(선택)
     if show_osm:
-        # centroid가 너무 거칠면 Nominatim으로 보정
-        query_parts = []
-        if region is not None:
-            query_parts.append("대한민국")
-            query_parts.append(region.sido)
-            query_parts.append(region.sigungu)
-            if region.dong and region.dong != "전체":
-                query_parts.append(region.dong)
-        geocode_query = " ".join([p for p in query_parts if p])
-        geo = geocode_korea_region(geocode_query) if geocode_query else None
-        if geo is not None:
-            base_lat, base_lon = geo
-
-        bbox = make_bbox(base_lat, base_lon, radius_km=float(osm_radius_km))
+        bbox = make_bbox(float(base_lat), float(base_lon), radius_km=float(osm_radius_km))
         with st.spinner("OSM 전력선 geometry 로딩 중..."):
             lines = fetch_osm_power_lines(bbox)
 
-        if not lines:
-            st.info("이 영역에서는 OSM 전력선 데이터를 찾지 못했습니다. (커버리지/레이트리밋 가능)")
-        else:
+        if lines:
             total = len(lines)
 
             def _power_rank(p: str) -> int:
@@ -447,7 +560,6 @@ def render_capacity_connection_map(
             def _line_key(ln) -> tuple[int, int, int]:
                 v = parse_voltage_value(getattr(ln, "voltage", "") or "")
                 v_key = int(v) if isinstance(v, int) else 1_000_000_000
-                # 짧은 선형은 디테일(도심 배전)일 가능성이 있어 살짝 우선
                 npts = len(getattr(ln, "lats", []) or [])
                 return (_power_rank(getattr(ln, "power", "")), v_key, npts)
 
@@ -463,133 +575,251 @@ def render_capacity_connection_map(
                 filtered_lines = sorted(filtered_lines, key=_line_key)
 
             shown = filtered_lines[: int(osm_max_lines)]
-            if prefer_distribution:
-                st.caption(
-                    f"OSM 전력선: {total}개 로드 → "
-                    f"필터 후 {len(filtered_lines)}개 → 표시 {len(shown)}개"
-                )
-            else:
-                st.caption(f"OSM 전력선: {total}개 로드 → 표시 {len(shown)}개")
+            st.caption(f"OSM 전력선: {total}개 로드 → 표시 {len(shown)}개")
 
             power_style = {
-                "minor_line": ("rgba(30,64,175,0.35)", 2),
-                "cable": ("rgba(2,132,199,0.25)", 2),
-                "line": ("rgba(15,23,42,0.22)", 2),
+                "minor_line": ("rgba(30,64,175,0.45)", 3),
+                "cable": ("rgba(2,132,199,0.35)", 3),
+                "line": ("rgba(15,23,42,0.30)", 3),
             }
-
             for ln in shown:
+                lats = ln.lats
+                lons = ln.lons
+                if len(lats) > 220:
+                    step = max(1, int(len(lats) / 220))
+                    lats = lats[::step]
+                    lons = lons[::step]
+
+                col, width = power_style.get(ln.power, ("rgba(15,23,42,0.28)", 3))
                 title = ln.name
                 if ln.voltage:
                     title = f"{title} ({ln.voltage}V)"
-                col, width = power_style.get(ln.power, ("rgba(15,23,42,0.22)", 2))
                 fig.add_trace(
                     go.Scattermapbox(
-                        lat=ln.lats,
-                        lon=ln.lons,
+                        lat=lats,
+                        lon=lons,
                         mode="lines",
                         line=dict(color=col, width=width),
                         hoverinfo="text",
                         text=title,
-                        name="OSM power",
                         showlegend=False,
                     )
                 )
 
-    # 선 먼저
-    for color, coords in segments_by_color.items():
+    # 구조선(수전->변압기)
+    if seg_sub_mtr["lat"]:
+        fig.add_trace(
+            go.Scattermapbox(
+                lat=seg_sub_mtr["lat"],
+                lon=seg_sub_mtr["lon"],
+                mode="lines",
+                line=dict(color="rgba(15,23,42,0.25)", width=3),
+                hoverinfo="skip",
+                showlegend=False,
+            )
+        )
+
+    # 용량선(변압기->DL)
+    for color, coords in seg_mtr_dl.items():
         if not coords["lat"]:
             continue
+        width = 8
+        if color == "#dc3545":
+            width = 10
+        elif color == "#fd7e14":
+            width = 9
         fig.add_trace(
             go.Scattermapbox(
                 lat=coords["lat"],
                 lon=coords["lon"],
                 mode="lines",
-                line=dict(color=color, width=3),
+                line=dict(color=color, width=width),
                 hoverinfo="skip",
-                name=f"lines:{color}",
                 showlegend=False,
             )
         )
 
-    # 점(선로)
-    lats = [v["lat"] for v in points.values()]
-    lons = [v["lon"] for v in points.values()]
-    cols = [v["color"] for v in points.values()]
-    hovers = [v["hover"] for v in points.values()]
-
+    # DL 점
+    dl_items = list(dl_pts.items())
+    dl_keys = [k for k, _ in dl_items]
+    dl_lats = [v["lat"] for _, v in dl_items]
+    dl_lons = [v["lon"] for _, v in dl_items]
+    dl_cols = [v["color"] for _, v in dl_items]
+    dl_hover = [v["hover"] for _, v in dl_items]
     fig.add_trace(
         go.Scattermapbox(
-            lat=lats,
-            lon=lons,
+            lat=dl_lats,
+            lon=dl_lons,
             mode="markers",
-            marker=dict(size=10, color=cols, opacity=0.9),
-            hoverinfo="text",
-            text=hovers,
-            name="DL",
+            marker=dict(
+                size=15,
+                color=dl_cols,
+                opacity=0.95,
+                line=dict(width=1.2, color="rgba(0,0,0,0.55)"),
+            ),
+            hovertemplate="%{text}<extra></extra>",
+            text=dl_hover,
+            customdata=dl_keys,
+            hoverlabel=dict(bgcolor="rgba(255,255,255,0.95)", font=dict(size=13, color="#0f172a")),
             showlegend=False,
         )
     )
 
-    # 선택 선로 강조
-    selected_dl_key = (
-        selected_record.dl_cd or selected_record.dl_nm or ""
-    ).strip() or "(unknown-dl)"
-    selected_point_key = f"{selected_subst_key}:{selected_mtr_key}:{selected_dl_key}"
-    sp = points.get(selected_point_key)
+    # 수전/변압기 마커(선 범위 기준)
+    if sub_e:
+        s_lats = [v["lat"] for v in sub_e.values()]
+        s_lons = [v["lon"] for v in sub_e.values()]
+        s_hover = [v["hover"] for v in sub_e.values()]
+        fig.add_trace(
+            go.Scattermapbox(
+                lat=s_lats,
+                lon=s_lons,
+                mode="markers",
+                marker=dict(
+                    size=21,
+                    color="#111827",
+                    symbol="triangle",
+                    opacity=0.95,
+                    line=dict(width=1.4, color="rgba(255,255,255,0.90)"),
+                ),
+                hovertemplate="%{text}<extra></extra>",
+                text=s_hover,
+                hoverlabel=dict(
+                    bgcolor="rgba(255,255,255,0.95)", font=dict(size=13, color="#0f172a")
+                ),
+                showlegend=False,
+            )
+        )
+
+    if mtr_e:
+        m_lats = [v["lat"] for v in mtr_e.values()]
+        m_lons = [v["lon"] for v in mtr_e.values()]
+        m_hover = [v["hover"] for v in mtr_e.values()]
+        fig.add_trace(
+            go.Scattermapbox(
+                lat=m_lats,
+                lon=m_lons,
+                mode="markers",
+                marker=dict(
+                    size=17,
+                    color="#0f172a",
+                    symbol="square",
+                    opacity=0.9,
+                    line=dict(width=1.0, color="rgba(255,255,255,0.75)"),
+                ),
+                hovertemplate="%{text}<extra></extra>",
+                text=m_hover,
+                hoverlabel=dict(
+                    bgcolor="rgba(255,255,255,0.95)", font=dict(size=13, color="#0f172a")
+                ),
+                showlegend=False,
+            )
+        )
+
+    # 선택 선로 강조(링)
+    sel_key = f"{selected_subst_key}:{selected_mtr_key}:{selected_dl_key}"
+    sp = dl_pts.get(sel_key)
     if sp is not None:
         fig.add_trace(
             go.Scattermapbox(
                 lat=[sp["lat"]],
                 lon=[sp["lon"]],
                 mode="markers",
-                marker=dict(size=18, color="#111827", opacity=0.85),
-                hoverinfo="text",
-                text=["<b>SELECTED</b><br>" + sp["hover"]],
+                marker=dict(
+                    size=26,
+                    color="rgba(255,255,255,0.85)",
+                    opacity=0.95,
+                    line=dict(width=3.0, color="#111827"),
+                ),
+                hoverinfo="skip",
                 showlegend=False,
             )
         )
 
+    uirev = f"capacity-map:{region.display_name if region else 'default'}"
     fig.update_layout(
         margin=dict(l=0, r=0, t=10, b=0),
-        height=640,
+        height=680,
         mapbox=dict(
-            style="open-street-map",
+            style=base_style,
             center=dict(lat=float(base_lat), lon=float(base_lon)),
             zoom=float(zoom),
         ),
+        uirevision=uirev,
     )
-    st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True})
 
-    st.divider()
-    st.subheader("선택 선로 상세")
+    col_map, col_info = st.columns([0.73, 0.27], gap="large")
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("변전소", selected_record.subst_nm or selected_record.subst_cd)
-    c2.metric("변압기", selected_record.mtr_no)
-    c3.metric("DL", selected_record.dl_nm or selected_record.dl_cd)
-    c4.metric("최소 여유", f"{selected_record.min_capacity:,} kW")
-
-    d1, d2, d3 = st.columns(3)
-    d1.write(f"변전소 여유: {format_capacity(selected_record.substation_capacity)}")
-    d2.write(f"변압기 여유: {format_capacity(selected_record.transformer_capacity)}")
-    d3.write(f"DL 여유: {format_capacity(selected_record.dl_capacity)}")
-
-    st.subheader("연결된 선로(같은 변전소/변압기)")
-    connected = grouped.get((selected_subst_key, selected_mtr_key), [])
-    if not connected:
-        st.info("연결된 선로를 찾지 못했습니다.")
-        return
-
-    rows = []
-    for r in sorted(connected, key=lambda x: x.min_capacity):
-        rows.append(
-            {
-                "DL": (r.dl_nm or r.dl_cd),
-                "최소 여유(kW)": r.min_capacity,
-                "변전소 여유": r.substation_capacity,
-                "변압기 여유": r.transformer_capacity,
-                "DL 여유": r.dl_capacity,
-            }
+    with col_map:
+        plot_state = st.plotly_chart(
+            fig,
+            use_container_width=True,
+            config={"scrollZoom": True, "displayModeBar": False},
+            key="capacity_map_chart",
+            on_select="rerun",
+            selection_mode="points",
         )
-    df = pd.DataFrame(rows)
-    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    # 클릭(포인트 선택) 이벤트 처리: DL 점의 customdata(point_key)를 읽어 selectbox 값을 갱신
+    clicked_key: str | None = None
+    if hasattr(plot_state, "get"):
+        sel = plot_state.get("selection")
+        if isinstance(sel, dict):
+            pts = sel.get("points")
+            if isinstance(pts, list) and pts:
+                for p in reversed(pts):
+                    if not isinstance(p, dict):
+                        continue
+                    cd = p.get("customdata")
+                    if isinstance(cd, str):
+                        clicked_key = cd
+                        break
+                    if isinstance(cd, (list, tuple)) and cd and isinstance(cd[0], str):
+                        clicked_key = cd[0]
+                        break
+
+    if clicked_key and clicked_key in key_to_record and clicked_key != str(selected_key):
+        st.session_state["map_selected_dl_key"] = clicked_key
+        st.rerun()
+
+    with col_info:
+        st.subheader("선택 선로 상세")
+
+        st.markdown(
+            """
+**표시 규칙**
+- 수전(변전소): 검은 △
+- 변압기: 검은 ■
+- DL: 색 ● (용량)
+""".strip()
+        )
+
+        st.divider()
+        st.metric("변전소", selected_record.subst_nm or selected_record.subst_cd)
+        st.metric("변압기", selected_record.mtr_no)
+        st.metric("DL", selected_record.dl_nm or selected_record.dl_cd)
+        st.metric("최소 여유", f"{selected_record.min_capacity:,} kW")
+
+        st.write(f"변전소 여유: {format_capacity(selected_record.substation_capacity)}")
+        st.write(f"변압기 여유: {format_capacity(selected_record.transformer_capacity)}")
+        st.write(f"DL 여유: {format_capacity(selected_record.dl_capacity)}")
+
+        connected = grouped_all.get((selected_subst_key, selected_mtr_key), [])
+        if not connected:
+            st.info("연결된 선로를 찾지 못했습니다.")
+            return
+
+        with st.expander("연결된 선로(같은 변전소/변압기)", expanded=True):
+            rows = []
+            for r in sorted(connected, key=lambda x: x.min_capacity):
+                rows.append(
+                    {
+                        "DL": (r.dl_nm or r.dl_cd),
+                        "최소 여유(kW)": r.min_capacity,
+                        "변전소 여유": r.substation_capacity,
+                        "변압기 여유": r.transformer_capacity,
+                        "DL 여유": r.dl_capacity,
+                    }
+                )
+            df = pd.DataFrame(rows)
+            st.dataframe(df, use_container_width=True, hide_index=True, height=320)

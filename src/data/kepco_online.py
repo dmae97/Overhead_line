@@ -317,6 +317,7 @@ class KepcoOnlineScraper:
         sido: str,
         sigungu: str,
         dong: str = "",
+        li: str = "",
         jibun: str = "",
     ) -> list[CapacityRecord]:
         """RegionInfo 스타일 입력으로 조회.
@@ -324,7 +325,7 @@ class KepcoOnlineScraper:
         sigungu를 "시 + 구/군"으로 분리하여 내부 fetch_capacity 호출.
         """
         si, gu = self._split_sigungu(sigungu, sido)
-        return self.fetch_capacity(sido=sido, si=si, gu=gu, dong=dong, jibun=jibun)
+        return self.fetch_capacity(sido=sido, si=si, gu=gu, dong=dong, li=li, jibun=jibun)
 
     @staticmethod
     def _split_sigungu(sigungu: str, sido: str) -> tuple[str, str]:

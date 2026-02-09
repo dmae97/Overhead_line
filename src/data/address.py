@@ -19,16 +19,14 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import Any, cast
 
+import pandas as pd
 import PublicDataReader
 import streamlit as st
 
 from src.core.exceptions import AddressDataError
 from src.data.models import AddressParams, RegionInfo
-
-if TYPE_CHECKING:
-    import pandas as pd
 
 logger = logging.getLogger(__name__)
 
@@ -37,8 +35,13 @@ logger = logging.getLogger(__name__)
 def load_bdong_codes() -> pd.DataFrame:
     """법정동코드 전체 로드 (현행 데이터만, 24시간 캐시)."""
     try:
-        df = PublicDataReader.code_bdong()
-        active = df[df["말소일자"].isna() | (df["말소일자"] == "")].copy()
+        raw = PublicDataReader.code_bdong()
+        df = cast("pd.DataFrame", raw if isinstance(raw, pd.DataFrame) else pd.DataFrame(raw))
+
+        if "말소일자" not in df.columns:
+            raise AddressDataError("법정동코드 데이터에 '말소일자' 컬럼이 없습니다.")
+
+        active = cast("pd.DataFrame", df[df["말소일자"].isna() | (df["말소일자"] == "")].copy())
         logger.info("법정동코드 로드 완료: %d건 (현행)", len(active))
         return active
     except Exception as e:
@@ -48,7 +51,8 @@ def load_bdong_codes() -> pd.DataFrame:
 def get_sido_list() -> list[str]:
     """시/도 목록 반환 (정렬)."""
     df = load_bdong_codes()
-    return sorted(df["시도명"].dropna().unique().tolist())
+    col = cast("Any", df["시도명"])
+    return sorted(col.dropna().unique().tolist())
 
 
 def get_sigungu_list(sido_name: str) -> list[str]:
@@ -57,8 +61,9 @@ def get_sigungu_list(sido_name: str) -> list[str]:
     시군구가 없는 광역시/특별자치시(세종시 등)는 시도명을 반환한다.
     """
     df = load_bdong_codes()
-    filtered = df[df["시도명"] == sido_name]
-    result = filtered["시군구명"].dropna().unique().tolist()
+    filtered = cast("pd.DataFrame", df[df["시도명"] == sido_name])
+    col = cast("Any", filtered["시군구명"])
+    result = col.dropna().unique().tolist()
     result = sorted([s for s in result if s])
 
     # 시군구가 없으면 시도명을 시군구로 사용 (세종시 등)
@@ -70,9 +75,38 @@ def get_sigungu_list(sido_name: str) -> list[str]:
 def get_dong_list(sido_name: str, sigungu_name: str) -> list[str]:
     """선택한 시/군/구 내 읍/면/동 목록 반환 (정렬)."""
     df = load_bdong_codes()
-    filtered = df[(df["시도명"] == sido_name) & (df["시군구명"] == sigungu_name)]
-    result = filtered["읍면동명"].dropna().unique().tolist()
+    # 세종시 등 시군구가 없는 케이스는 시군구명이 빈 행이므로 별도 처리
+    if sigungu_name == sido_name:
+        filtered = cast("pd.DataFrame", df[(df["시도명"] == sido_name) & (df["시군구명"] == "")])
+    else:
+        filtered = cast(
+            "pd.DataFrame", df[(df["시도명"] == sido_name) & (df["시군구명"] == sigungu_name)]
+        )
+    col = cast("Any", filtered["읍면동명"])
+    result = col.dropna().unique().tolist()
     return sorted([d for d in result if d])
+
+
+def get_ri_list(sido_name: str, sigungu_name: str, dong_name: str) -> list[str]:
+    """선택한 읍/면/동 내 리 목록 반환 (정렬).
+
+    도심(동) 지역은 리가 없을 수 있으며, 그 경우 빈 리스트를 반환한다.
+    """
+    if not dong_name or dong_name == "전체":
+        return []
+
+    df = load_bdong_codes()
+    if sigungu_name == sido_name:
+        filtered = cast("pd.DataFrame", df[(df["시도명"] == sido_name) & (df["시군구명"] == "")])
+    else:
+        filtered = cast(
+            "pd.DataFrame", df[(df["시도명"] == sido_name) & (df["시군구명"] == sigungu_name)]
+        )
+
+    filtered = cast("pd.DataFrame", filtered[filtered["읍면동명"] == dong_name])
+    col = cast("Any", filtered["동리명"])
+    result = col.dropna().unique().tolist()
+    return sorted([r for r in result if r and r != "전체"])
 
 
 def to_kepco_params(region: RegionInfo) -> AddressParams:
@@ -89,11 +123,15 @@ def to_kepco_params(region: RegionInfo) -> AddressParams:
 
     # 시군구가 시도명과 같으면 (세종시 등) 시군구명이 빈 행을 찾음
     if region.sido == region.sigungu:
-        matched = df[(df["시도명"] == region.sido) & (df["시군구명"] == "")]
+        matched = cast("pd.DataFrame", df[(df["시도명"] == region.sido) & (df["시군구명"] == "")])
         # 36000 같은 시도 전체 코드 제외, 36110 같은 실제 행정구역만
-        matched = matched[matched["시군구코드"].astype(str).str.endswith("110")]
+        codes = cast("Any", matched["시군구코드"]).astype(str)
+        mask = codes.apply(lambda x: str(x).endswith("110"))
+        matched = cast("pd.DataFrame", matched[mask])
     else:
-        matched = df[(df["시도명"] == region.sido) & (df["시군구명"] == region.sigungu)]
+        matched = cast(
+            "pd.DataFrame", df[(df["시도명"] == region.sido) & (df["시군구명"] == region.sigungu)]
+        )
 
     if matched.empty:
         raise AddressDataError(
@@ -105,9 +143,11 @@ def to_kepco_params(region: RegionInfo) -> AddressParams:
     sigungu_cd = str(row["시군구코드"]).zfill(5)
 
     dong = region.dong if region.dong and region.dong != "전체" else ""
+    ri = region.ri if dong and region.ri and region.ri != "전체" else ""
 
     return AddressParams(
         metro_cd=sido_cd,
         city_cd=sigungu_cd[2:],
         dong=dong,
+        ri=ri,
     )
