@@ -72,21 +72,28 @@ def render_hierarchy_sankey(records: list[CapacityRecord]) -> None:
 
     dl_total = len(dl_keys_all)
 
-    # Streamlit slider는 step 정합성(값/범위) 문제로 예외가 날 수 있어,
-    # 작은 범위에서도 항상 안전하게 동작하도록 step=1로 둔다.
+    # 슬라이더는 min_value < max_value가 보장될 때만 렌더링한다.
     slider_min = 10
-    slider_max = max(slider_min, min(300, dl_total or slider_min))
-    max_dl_default = 60 if dl_total > 60 else max(slider_min, dl_total)
-    max_dl_default = max(slider_min, min(slider_max, int(max_dl_default)))
-
-    max_dl = st.slider(
-        "DL 표시 상한",
-        min_value=int(slider_min),
-        max_value=int(slider_max),
-        value=int(max_dl_default),
-        step=1,
-        help="DL이 많으면 선이 겹쳐 시인성이 떨어집니다.",
-    )
+    if dl_total <= slider_min:
+        # DL이 적으면 슬라이더 없이 전부 표시
+        max_dl = dl_total or slider_min
+        if dl_total > 0:
+            st.caption(f"DL {dl_total}건 — 소량이라 전부 표시합니다.")
+    else:
+        slider_max = int(min(300, dl_total))
+        default_val = int(min(60, dl_total))
+        try:
+            max_dl = st.slider(
+                "DL 표시 상한",
+                min_value=slider_min,
+                max_value=slider_max,
+                value=max(slider_min, min(slider_max, default_val)),
+                step=1,
+                help="DL이 많으면 선이 겹쳐 시인성이 떨어집니다.",
+            )
+        except Exception:
+            max_dl = min(60, dl_total)
+            st.caption(f"슬라이더 오류 → DL 표시 상한을 {max_dl}으로 고정합니다.")
     sort_mode = st.radio(
         "DL 선택 기준",
         options=["최소여유 낮은순", "최소여유 높은순"],

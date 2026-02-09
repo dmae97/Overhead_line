@@ -537,64 +537,81 @@ def main() -> None:
             "🧾 실데이터",
         ]
     )
+
+    def _safe_render(fn, *args, **kwargs) -> None:
+        """탭 렌더링 중 예외가 발생해도 앱 전체를 죽이지 않는다."""
+        try:
+            fn(*args, **kwargs)
+        except Exception as exc:
+            logger.warning("탭 렌더링 오류: %s", exc, exc_info=True)
+            st.error(f"이 탭 표시 중 오류가 발생했습니다: {exc}")
+
     with tab1:
-        render_capacity_bar_chart(records)
+        _safe_render(render_capacity_bar_chart, records)
     with tab2:
-        render_capacity_breakdown_chart(records)
+        _safe_render(render_capacity_breakdown_chart, records)
     with tab3:
-        render_substation_group_view(records)
+        _safe_render(render_substation_group_view, records)
     with tab4:
-        render_hierarchy_sankey(records)
+        _safe_render(render_hierarchy_sankey, records)
     with tab5:
-        sub1, sub2 = st.tabs(["📌 조회 이력", "🧭 현재 선로(근사 연결)"])
+        try:
+            sub1, sub2 = st.tabs(["📌 조회 이력", "🧭 현재 선로(근사 연결)"])
 
-        with sub1:
-            rows: list[QueryHistoryRecord] = []
-            db_error: str | None = None
-            try:
-                repo = HistoryRepository()
-                rows = repo.list_recent(limit=200)
-            except Exception as exc:
-                db_error = str(exc)
+            with sub1:
+                rows: list[QueryHistoryRecord] = []
+                db_error: str | None = None
+                try:
+                    repo = HistoryRepository()
+                    rows = repo.list_recent(limit=200)
+                except Exception as exc:
+                    db_error = str(exc)
 
-            # DB가 비어있거나(첫 조회/재배포 직후), 저장 실패해도 현재/세션 데이터로 지도 표시
-            if not rows:
-                session_rows = st.session_state.get("_session_history_rows")
-                if isinstance(session_rows, list) and session_rows:
-                    try:
-                        rows = [QueryHistoryRecord.model_validate(x) for x in session_rows[-200:]]
-                    except Exception:
-                        rows = []
+                if not rows:
+                    session_rows = st.session_state.get("_session_history_rows")
+                    if isinstance(session_rows, list) and session_rows:
+                        try:
+                            rows = [
+                                QueryHistoryRecord.model_validate(x) for x in session_rows[-200:]
+                            ]
+                        except Exception:
+                            rows = []
 
-            if not rows:
-                current = st.session_state.get("_current_history_record")
-                if isinstance(current, dict):
-                    try:
-                        rows = [QueryHistoryRecord.model_validate(current)]
-                    except Exception:
-                        rows = []
+                if not rows:
+                    current = st.session_state.get("_current_history_record")
+                    if isinstance(current, dict):
+                        try:
+                            rows = [QueryHistoryRecord.model_validate(current)]
+                        except Exception:
+                            rows = []
 
-            if db_error and not rows:
-                st.warning(f"조회 이력 DB 접근 실패: {db_error}")
+                if db_error and not rows:
+                    st.warning(f"조회 이력 DB 접근 실패: {db_error}")
 
-            render_korea_query_map(rows)
+                render_korea_query_map(rows)
 
-        with sub2:
-            # 현재 조회 데이터는 '선로 좌표'가 없으므로 지역 중심점 주변에 임의 분산 배치한다.
-            region_obj: RegionInfo | None = None
-            meta = st.session_state.get("_last_query_meta")
-            if isinstance(meta, dict):
-                raw_region = meta.get("region")
-                if isinstance(raw_region, dict):
-                    try:
-                        region_obj = RegionInfo.model_validate(raw_region)
-                    except Exception:
-                        region_obj = None
+            with sub2:
+                region_obj: RegionInfo | None = None
+                meta = st.session_state.get("_last_query_meta")
+                if isinstance(meta, dict):
+                    raw_region = meta.get("region")
+                    if isinstance(raw_region, dict):
+                        try:
+                            region_obj = RegionInfo.model_validate(raw_region)
+                        except Exception:
+                            region_obj = None
 
-            render_capacity_connection_map(records, region_obj)
+                render_capacity_connection_map(records, region_obj)
+        except Exception as exc:
+            logger.warning("지도 탭 렌더링 오류: %s", exc, exc_info=True)
+            st.error(f"지도 탭 표시 중 오류: {exc}")
     with tab6:
-        meta = st.session_state.get("_last_query_meta")
-        render_provenance(records, meta)
+        try:
+            meta = st.session_state.get("_last_query_meta")
+            render_provenance(records, meta)
+        except Exception as exc:
+            logger.warning("실데이터 탭 렌더링 오류: %s", exc, exc_info=True)
+            st.error(f"실데이터 탭 표시 중 오류: {exc}")
 
     st.divider()
     render_download_buttons(records, region_name=data_label)

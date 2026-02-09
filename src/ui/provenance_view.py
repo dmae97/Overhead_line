@@ -54,12 +54,20 @@ def render_provenance(records: list[CapacityRecord], meta: Any) -> None:
 
     st.divider()
     st.write("원본 레코드(일부)")
-    sample_n = st.slider(
-        "표시 건수",
-        min_value=1,
-        max_value=min(50, max(1, len(records))),
-        value=min(10, len(records)),
-    )
+    total = len(records)
+    if total <= 1:
+        sample_n = total
+    else:
+        upper = min(50, total)
+        try:
+            sample_n = st.slider(
+                "표시 건수",
+                min_value=1,
+                max_value=upper,
+                value=min(10, upper),
+            )
+        except Exception:
+            sample_n = min(10, total)
 
     # CapacityRecord는 snake_case + alias 모두 지원하므로, by_alias=True로 원본 키를 보여준다.
     raw = [r.model_dump(by_alias=True) for r in records[: int(sample_n)]]
