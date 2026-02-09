@@ -22,7 +22,7 @@ from src.data.models import CapacityRecord, QueryHistoryRecord, RegionInfo
 from src.ui.charts import render_capacity_bar_chart, render_capacity_breakdown_chart
 from src.ui.dashboard import render_history_panel, render_result_table
 from src.ui.group_view import render_substation_group_view
-from src.ui.map_view import render_korea_query_map
+from src.ui.map_view import render_capacity_connection_map, render_korea_query_map
 from src.ui.network_view import render_hierarchy_sankey
 from src.ui.provenance_view import render_provenance
 from src.ui.sidebar import render_region_selector
@@ -545,35 +545,52 @@ def main() -> None:
     with tab4:
         render_hierarchy_sankey(records)
     with tab5:
-        rows: list[QueryHistoryRecord] = []
-        db_error: str | None = None
-        try:
-            repo = HistoryRepository()
-            rows = repo.list_recent(limit=200)
-        except Exception as exc:
-            db_error = str(exc)
+        sub1, sub2 = st.tabs(["📌 조회 이력", "🧭 현재 선로(근사 연결)"])
 
-        # DB가 비어있거나(첫 조회/재배포 직후), 저장 실패해도 현재/세션 데이터로 지도 표시
-        if not rows:
-            session_rows = st.session_state.get("_session_history_rows")
-            if isinstance(session_rows, list) and session_rows:
-                try:
-                    rows = [QueryHistoryRecord.model_validate(x) for x in session_rows[-200:]]
-                except Exception:
-                    rows = []
+        with sub1:
+            rows: list[QueryHistoryRecord] = []
+            db_error: str | None = None
+            try:
+                repo = HistoryRepository()
+                rows = repo.list_recent(limit=200)
+            except Exception as exc:
+                db_error = str(exc)
 
-        if not rows:
-            current = st.session_state.get("_current_history_record")
-            if isinstance(current, dict):
-                try:
-                    rows = [QueryHistoryRecord.model_validate(current)]
-                except Exception:
-                    rows = []
+            # DB가 비어있거나(첫 조회/재배포 직후), 저장 실패해도 현재/세션 데이터로 지도 표시
+            if not rows:
+                session_rows = st.session_state.get("_session_history_rows")
+                if isinstance(session_rows, list) and session_rows:
+                    try:
+                        rows = [QueryHistoryRecord.model_validate(x) for x in session_rows[-200:]]
+                    except Exception:
+                        rows = []
 
-        if db_error and not rows:
-            st.warning(f"조회 이력 DB 접근 실패: {db_error}")
+            if not rows:
+                current = st.session_state.get("_current_history_record")
+                if isinstance(current, dict):
+                    try:
+                        rows = [QueryHistoryRecord.model_validate(current)]
+                    except Exception:
+                        rows = []
 
-        render_korea_query_map(rows)
+            if db_error and not rows:
+                st.warning(f"조회 이력 DB 접근 실패: {db_error}")
+
+            render_korea_query_map(rows)
+
+        with sub2:
+            # 현재 조회 데이터는 '선로 좌표'가 없으므로 지역 중심점 주변에 임의 분산 배치한다.
+            region_obj: RegionInfo | None = None
+            meta = st.session_state.get("_last_query_meta")
+            if isinstance(meta, dict):
+                raw_region = meta.get("region")
+                if isinstance(raw_region, dict):
+                    try:
+                        region_obj = RegionInfo.model_validate(raw_region)
+                    except Exception:
+                        region_obj = None
+
+            render_capacity_connection_map(records, region_obj)
     with tab6:
         meta = st.session_state.get("_last_query_meta")
         render_provenance(records, meta)
