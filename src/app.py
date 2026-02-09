@@ -21,6 +21,9 @@ from src.data.models import CapacityRecord, QueryHistoryRecord, RegionInfo
 from src.ui.charts import render_capacity_bar_chart, render_capacity_breakdown_chart
 from src.ui.dashboard import render_history_panel, render_result_table
 from src.ui.group_view import render_substation_group_view
+from src.ui.map_view import render_korea_query_map
+from src.ui.network_view import render_hierarchy_sankey
+from src.ui.provenance_view import render_provenance
 from src.ui.sidebar import render_region_selector
 from src.utils.cache import fetch_capacity_cached
 from src.utils.export import render_download_buttons
@@ -141,6 +144,12 @@ def _fetch_online_with_cache(
                     "label": str(label or region.display_name),
                     "auto_reload": False,
                 }
+                st.session_state["_last_query_meta"] = {
+                    "mode": "online",
+                    "region": region.model_dump(),
+                    "jibun": jibun,
+                    "cached": True,
+                }
                 return recs, str(label or region.display_name)
 
         with st.spinner(f"🌐 한전ON에서 {region.display_name} 여유용량 조회 중..."):
@@ -162,6 +171,12 @@ def _fetch_online_with_cache(
             "label": f"{region.display_name} (한전ON)",
             "auto_reload": False,
         }
+        st.session_state["_last_query_meta"] = {
+            "mode": "online",
+            "region": region.model_dump(),
+            "jibun": jibun,
+            "cached": False,
+        }
         return records, f"{region.display_name} (한전ON)"
 
     except ScraperError as exc:
@@ -179,6 +194,11 @@ def _fetch_online_with_cache(
         sample = load_sample_records()
         if sample:
             st.sidebar.success(f"📦 샘플 데이터 {len(sample)}건을 표시합니다.")
+            st.session_state["_last_query_meta"] = {
+                "mode": "sample",
+                "cached": False,
+                "reason": "scraper_error_fallback",
+            }
             return sample, "샘플 데이터 (데모)"
         return None, ""
     except Exception as exc:
@@ -238,6 +258,11 @@ def _render_query_sidebar() -> tuple[list[CapacityRecord] | None, str]:
         file_bytes = uploaded_file.read()
         records = load_records_from_uploaded_file(file_bytes, uploaded_file.name)
         if records:
+            st.session_state["_last_query_meta"] = {
+                "mode": "upload",
+                "filename": uploaded_file.name,
+                "cached": False,
+            }
             return records, "업로드 데이터"
         st.sidebar.error("파일에서 유효한 데이터를 찾을 수 없습니다.")
         return None, ""
@@ -310,6 +335,21 @@ def _render_query_sidebar() -> tuple[list[CapacityRecord] | None, str]:
                     "label": str(label or region.display_name),
                     "auto_reload": auto_reload,
                 }
+                # provenance 탭에서 표시할 메타
+                st.session_state["_last_query_meta"] = {
+                    "mode": "api",
+                    "region": region.model_dump(),
+                    "jibun": jibun,
+                    "params": {
+                        "metroCd": params.metro_cd,
+                        "cityCd": params.city_cd,
+                        "addrLidong": params.dong,
+                        "addrLi": params.ri,
+                        "addrJibun": params.jibun,
+                        "returnType": "json",
+                    },
+                    "cached": True,
+                }
                 return recs, str(label or region.display_name)
 
         with st.spinner(f"{region.display_name} 여유용량 조회 중..."):
@@ -325,6 +365,20 @@ def _render_query_sidebar() -> tuple[list[CapacityRecord] | None, str]:
             "next_ts": float(now) + min_interval_seconds,
             "label": region.display_name,
             "auto_reload": auto_reload,
+        }
+        st.session_state["_last_query_meta"] = {
+            "mode": "api",
+            "region": region.model_dump(),
+            "jibun": jibun,
+            "params": {
+                "metroCd": params.metro_cd,
+                "cityCd": params.city_cd,
+                "addrLidong": params.dong,
+                "addrLi": params.ri,
+                "addrJibun": params.jibun,
+                "returnType": "json",
+            },
+            "cached": False,
         }
         return records, region.display_name
     except KepcoNoDataError:
@@ -397,32 +451,89 @@ def main() -> None:
 
     st.divider()
 
-    tab1, tab2, tab3 = st.tabs(["📊 최소 여유용량", "📈 레벨별 비교", "🏭 변전소별 그룹핑"])
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+        [
+            "📊 최소 여유용량",
+            "📈 레벨별 비교",
+            "🏭 변전소별 그룹핑",
+            "🔗 선로 연결도",
+            "🗺️ 지도",
+            "🧾 실데이터",
+        ]
+    )
     with tab1:
         render_capacity_bar_chart(records)
     with tab2:
         render_capacity_breakdown_chart(records)
     with tab3:
         render_substation_group_view(records)
+    with tab4:
+        render_hierarchy_sankey(records)
+    with tab5:
+        try:
+            repo = HistoryRepository()
+            rows = repo.list_recent(limit=200)
+        except Exception:
+            rows = []
+        render_korea_query_map(rows)
+    with tab6:
+        meta = st.session_state.get("_last_query_meta")
+        render_provenance(records, meta)
 
     st.divider()
     render_download_buttons(records, region_name=data_label)
 
     st.divider()
 
-    # 조회 이력 저장
+    # 조회 이력 저장 (Streamlit rerun 중복 저장 방지)
     try:
-        repo = HistoryRepository()
-        repo.save(
-            QueryHistoryRecord(
-                region_name=data_label,
-                metro_cd="",
-                city_cd="",
-                dong="",
-                result_count=len(records),
-                queried_at=datetime.now(),
+        meta = st.session_state.get("_last_query_meta")
+        timer_state = st.session_state.get("_timer_state")
+        last_ts = ""
+        if isinstance(timer_state, dict) and timer_state.get("last_ts") is not None:
+            last_ts = str(timer_state.get("last_ts"))
+        save_key = f"{data_label}:{len(records)}:{last_ts}"
+
+        if st.session_state.get("_last_saved_history_key") != save_key:
+            st.session_state["_last_saved_history_key"] = save_key
+            meta_dict = meta if isinstance(meta, dict) else {}
+            region_dict = (
+                meta_dict.get("region") if isinstance(meta_dict.get("region"), dict) else {}
             )
-        )
+
+            min_caps = [r.min_capacity for r in records]
+            min_caps_sorted = sorted(min_caps)
+            min_cap_min = int(min_caps_sorted[0]) if min_caps_sorted else 0
+            min_cap_max = int(min_caps_sorted[-1]) if min_caps_sorted else 0
+            mid = len(min_caps_sorted) // 2
+            min_cap_median = int(min_caps_sorted[mid]) if min_caps_sorted else 0
+            connectable_count = sum(1 for r in records if r.is_connectable)
+            not_connectable_count = len(records) - connectable_count
+
+            repo = HistoryRepository()
+            params_dict = (
+                meta_dict.get("params") if isinstance(meta_dict.get("params"), dict) else {}
+            )
+
+            repo.save(
+                QueryHistoryRecord(
+                    region_name=data_label,
+                    metro_cd=str(params_dict.get("metroCd") or ""),
+                    city_cd=str(params_dict.get("cityCd") or ""),
+                    dong=str(params_dict.get("addrLidong") or ""),
+                    sido=str(region_dict.get("sido") or ""),
+                    sigungu=str(region_dict.get("sigungu") or ""),
+                    mode=str(meta_dict.get("mode") or ""),
+                    jibun=str(meta_dict.get("jibun") or ""),
+                    result_count=len(records),
+                    connectable_count=int(connectable_count),
+                    not_connectable_count=int(not_connectable_count),
+                    min_cap_min=int(min_cap_min),
+                    min_cap_median=int(min_cap_median),
+                    min_cap_max=int(min_cap_max),
+                    queried_at=datetime.now(),
+                )
+            )
     except Exception:
         logger.warning("조회 이력 저장 실패", exc_info=True)
 

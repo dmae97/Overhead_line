@@ -21,10 +21,32 @@ CREATE TABLE IF NOT EXISTS query_history (
     metro_cd    TEXT    NOT NULL,
     city_cd     TEXT    NOT NULL,
     dong        TEXT    NOT NULL DEFAULT '',
+    sigungu     TEXT    NOT NULL DEFAULT '',
+    sido        TEXT    NOT NULL DEFAULT '',
+    mode        TEXT    NOT NULL DEFAULT '',
+    jibun       TEXT    NOT NULL DEFAULT '',
     result_count INTEGER NOT NULL DEFAULT 0,
+    connectable_count INTEGER NOT NULL DEFAULT 0,
+    not_connectable_count INTEGER NOT NULL DEFAULT 0,
+    min_cap_min INTEGER NOT NULL DEFAULT 0,
+    min_cap_median INTEGER NOT NULL DEFAULT 0,
+    min_cap_max INTEGER NOT NULL DEFAULT 0,
     queried_at  TEXT    NOT NULL
 );
 """
+
+
+_MIGRATION_COLUMNS: list[tuple[str, str]] = [
+    ("sigungu", "TEXT NOT NULL DEFAULT ''"),
+    ("sido", "TEXT NOT NULL DEFAULT ''"),
+    ("mode", "TEXT NOT NULL DEFAULT ''"),
+    ("jibun", "TEXT NOT NULL DEFAULT ''"),
+    ("connectable_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("not_connectable_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("min_cap_min", "INTEGER NOT NULL DEFAULT 0"),
+    ("min_cap_median", "INTEGER NOT NULL DEFAULT 0"),
+    ("min_cap_max", "INTEGER NOT NULL DEFAULT 0"),
+]
 
 
 class HistoryRepository:
@@ -43,6 +65,7 @@ class HistoryRepository:
             conn = self._connect()
             try:
                 conn.execute(_CREATE_TABLE_SQL)
+                self._ensure_columns(conn)
                 conn.commit()
             finally:
                 conn.close()
@@ -50,12 +73,31 @@ class HistoryRepository:
             logger.exception("조회 이력 테이블 생성 실패")
             raise HistoryDBError(f"테이블 생성 실패: {exc}") from exc
 
+    @staticmethod
+    def _ensure_columns(conn: sqlite3.Connection) -> None:
+        """기존 DB에 누락된 컬럼이 있으면 비파괴적으로 추가한다."""
+        try:
+            rows = conn.execute("PRAGMA table_info(query_history)").fetchall()
+            existing = {str(r[1]) for r in rows}
+            for name, sql_type in _MIGRATION_COLUMNS:
+                if name in existing:
+                    continue
+                conn.execute(f"ALTER TABLE query_history ADD COLUMN {name} {sql_type}")
+        except sqlite3.Error:
+            # 마이그레이션 실패는 치명적이지만, 원인을 명확히 남긴다.
+            logger.exception("조회 이력 테이블 마이그레이션 실패")
+            raise
+
     def save(self, record: QueryHistoryRecord) -> int:
         sql = """
             INSERT INTO query_history (
-                region_name, metro_cd, city_cd, dong, result_count, queried_at
+                region_name, metro_cd, city_cd, dong, sigungu, sido, mode, jibun,
+                result_count,
+                connectable_count, not_connectable_count,
+                min_cap_min, min_cap_median, min_cap_max,
+                queried_at
             )
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         timestamp = record.queried_at.isoformat()
         try:
@@ -68,7 +110,16 @@ class HistoryRepository:
                         record.metro_cd,
                         record.city_cd,
                         record.dong,
+                        record.sigungu,
+                        record.sido,
+                        record.mode,
+                        record.jibun,
                         record.result_count,
+                        record.connectable_count,
+                        record.not_connectable_count,
+                        record.min_cap_min,
+                        record.min_cap_median,
+                        record.min_cap_max,
                         timestamp,
                     ),
                 )
@@ -124,6 +175,23 @@ class HistoryRepository:
 
     @staticmethod
     def _row_to_record(row: sqlite3.Row) -> QueryHistoryRecord:
+        keys = set(row.keys())
+
+        def _get_str(name: str, default: str = "") -> str:
+            if name not in keys:
+                return default
+            val = row[name]
+            return "" if val is None else str(val)
+
+        def _get_int(name: str, default: int = 0) -> int:
+            if name not in keys:
+                return default
+            val = row[name]
+            try:
+                return int(val)
+            except (TypeError, ValueError):
+                return default
+
         return QueryHistoryRecord(
             id=row["id"],
             region_name=row["region_name"],
@@ -131,5 +199,14 @@ class HistoryRepository:
             city_cd=row["city_cd"],
             dong=row["dong"],
             result_count=row["result_count"],
+            sigungu=_get_str("sigungu"),
+            sido=_get_str("sido"),
+            mode=_get_str("mode"),
+            jibun=_get_str("jibun"),
+            connectable_count=_get_int("connectable_count"),
+            not_connectable_count=_get_int("not_connectable_count"),
+            min_cap_min=_get_int("min_cap_min"),
+            min_cap_median=_get_int("min_cap_median"),
+            min_cap_max=_get_int("min_cap_max"),
             queried_at=datetime.fromisoformat(row["queried_at"]),
         )

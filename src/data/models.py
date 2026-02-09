@@ -129,5 +129,14 @@ class QueryHistoryRecord(BaseModel):
     metro_cd: str
     city_cd: str
     dong: str = ""
+    sigungu: str = ""
+    sido: str = ""
+    mode: str = ""
+    jibun: str = ""
     result_count: int = 0
+    connectable_count: int = 0
+    not_connectable_count: int = 0
+    min_cap_min: int = 0
+    min_cap_median: int = 0
+    min_cap_max: int = 0
     queried_at: datetime = Field(default_factory=datetime.now)

@@ -999,7 +999,6 @@ class KepcoOnlineScraper:
             _RESULT_IDS["vol1_1"],
             _RESULT_IDS["vol3_1"],
         ]
-        ids_json = json.dumps(check_ids)
 
         # Attempt 1: Playwright wait_for_function
         try:
@@ -1010,7 +1009,7 @@ class KepcoOnlineScraper:
                         return el && el.textContent.trim().length > 0;
                     });
                 }""",
-                ids_json,
+                check_ids,
                 timeout=_SEARCH_RESULT_TIMEOUT_MS,
             )
             logger.info("✅ 결과 데이터 로드 감지됨 (wait_for_function)")
