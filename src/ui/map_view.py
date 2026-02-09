@@ -16,7 +16,7 @@ from __future__ import annotations
 import hashlib
 import math
 from collections import defaultdict
-from typing import TYPE_CHECKING, TypedDict
+from typing import TYPE_CHECKING, Any, TypedDict
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -235,6 +235,64 @@ def _jitter_point(
     return base_lat + dlat, base_lon + dlon
 
 
+def _extract_plotly_selected_customdata(event: Any) -> str | None:
+    """Plotly selection event에서 customdata를 안전하게 추출.
+
+    Streamlit/버전에 따라 st.plotly_chart의 반환 타입이 dict 또는 객체일 수 있어
+    최대한 방어적으로 처리한다.
+    """
+
+    if event is None:
+        return None
+
+    sel: Any = None
+    if isinstance(event, dict):
+        sel = event.get("selection")
+    else:
+        try:
+            sel = event.selection
+        except Exception:
+            sel = None
+
+    points: Any = None
+    if isinstance(sel, dict):
+        points = sel.get("points")
+    else:
+        try:
+            points = sel.points
+        except Exception:
+            points = None
+
+    if points is None:
+        # 일부 구현에서는 event 자체에 points가 붙을 수 있다.
+        if isinstance(event, dict):
+            points = event.get("points")
+        else:
+            try:
+                points = event.points
+            except Exception:
+                points = None
+
+    if not isinstance(points, list) or not points:
+        return None
+
+    for p in reversed(points):
+        cd: Any = None
+        if isinstance(p, dict):
+            cd = p.get("customdata")
+        else:
+            try:
+                cd = p.customdata
+            except Exception:
+                cd = None
+
+        if isinstance(cd, str):
+            return cd
+        if isinstance(cd, (list, tuple)) and cd and isinstance(cd[0], str):
+            return cd[0]
+    return None
+
+
 def render_korea_query_map(rows: list[QueryHistoryRecord]) -> None:
     """조회 이력을 한반도 지도에 표시한다."""
 
@@ -398,8 +456,16 @@ def render_capacity_connection_map(
         options=["carto-positron", "open-street-map"],
         index=0,
         help="carto-positron은 심볼이 적어 시인성이 좋습니다.",
+        key="capacity_map_base_style",
     )
-    zoom = st.slider("기본 줌", min_value=6.0, max_value=14.0, value=11.0, step=0.1)
+    zoom = st.slider(
+        "기본 줌",
+        min_value=6.0,
+        max_value=14.0,
+        value=11.0,
+        step=0.1,
+        key="capacity_map_zoom",
+    )
     spread = st.slider(
         "점 분산(근사)",
         min_value=0.02,
@@ -407,6 +473,7 @@ def render_capacity_connection_map(
         value=0.08,
         step=0.01,
         help="geometry가 없어서 임의 분산 배치합니다.",
+        key="capacity_map_spread",
     )
 
     # OSM 오버레이(무료) 옵션
@@ -414,6 +481,7 @@ def render_capacity_connection_map(
         "공개 전력선 레이어(OSM/무료, 추정)",
         value=False,
         help="OSM의 power=line/minor_line/cable 선형을 지도에 오버레이합니다.",
+        key="capacity_map_show_osm",
     )
     prefer_distribution = True
     osm_radius_km = 12
@@ -425,9 +493,24 @@ def render_capacity_connection_map(
                 "배전 느낌(필터 강화)",
                 value=True,
                 help="minor_line 우선 + 낮은 전압 우선 + 자동 다운샘플.",
+                key="capacity_map_osm_prefer_distribution",
             )
-            osm_radius_km = st.slider("검색 반경(km)", 2, 40, 12, 2)
-            osm_max_lines = st.slider("최대 표시 선 수", 30, 400, 140, 10)
+            osm_radius_km = st.slider(
+                "검색 반경(km)",
+                2,
+                40,
+                12,
+                2,
+                key="capacity_map_osm_radius_km",
+            )
+            osm_max_lines = st.slider(
+                "최대 표시 선 수",
+                30,
+                400,
+                140,
+                10,
+                key="capacity_map_osm_max_lines",
+            )
             osm_max_kv = st.slider(
                 "최대 전압(kV)",
                 11,
@@ -435,6 +518,7 @@ def render_capacity_connection_map(
                 66,
                 11,
                 help="배전 위주면 22~66kV 권장. voltage 없는 선은 남겨둡니다.",
+                key="capacity_map_osm_max_kv",
             )
 
     # 데이터 필터
@@ -447,6 +531,7 @@ def render_capacity_connection_map(
         options=subst_options,
         default=default_subst,
         help="선로가 많으면 일부 변전소만 보는 걸 권장합니다.",
+        key="capacity_map_selected_subst",
     )
 
     filtered_records = (
@@ -469,9 +554,31 @@ def render_capacity_connection_map(
         option_rows.append((label, point_key, r))
 
     option_rows = sorted(option_rows, key=lambda x: x[0])
-    key_to_label = {k: lab for lab, k, _ in option_rows}
-    key_to_record = {k: rec for _, k, rec in option_rows}
-    select_keys = [k for _, k, _ in option_rows]
+    key_to_label: dict[str, str] = {}
+    key_to_record: dict[str, CapacityRecord] = {}
+    select_keys: list[str] = []
+    seen: set[str] = set()
+    for lab, k, rec in option_rows:
+        if k in seen:
+            continue
+        seen.add(k)
+        select_keys.append(k)
+        key_to_label[k] = lab
+        key_to_record[k] = rec
+
+    if not select_keys:
+        st.info("선로 선택 목록을 구성하지 못했습니다.")
+        return
+
+    # plotly_chart 클릭 선택은 rerun 전에 session_state에 들어올 수 있으므로,
+    # selectbox를 렌더링하기 전에 먼저 반영한다.
+    chart_clicked = _extract_plotly_selected_customdata(st.session_state.get("capacity_map_chart"))
+    if chart_clicked and chart_clicked in key_to_record:
+        st.session_state["map_selected_dl_key"] = chart_clicked
+
+    cur_key = st.session_state.get("map_selected_dl_key")
+    if isinstance(cur_key, str) and cur_key not in select_keys:
+        st.session_state["map_selected_dl_key"] = select_keys[0]
 
     selected_key = st.selectbox(
         "선로 선택(지도에서 점 클릭 가능)",
@@ -497,8 +604,11 @@ def render_capacity_connection_map(
         options=["선택한 변압기", "선택한 변전소", "전체"],
         index=0,
         horizontal=True,
+        key="capacity_map_edge_scope",
     )
-    show_all_points = st.checkbox("포인트 전체 표시", value=False)
+    show_all_points = st.checkbox(
+        "포인트 전체 표시", value=False, key="capacity_map_show_all_points"
+    )
 
     # 그룹핑(하단 표용)
     grouped_all: dict[tuple[str, str], list[CapacityRecord]] = defaultdict(list)
@@ -516,10 +626,11 @@ def render_capacity_connection_map(
     else:
         scope_records = filtered_records
 
-    point_records = filtered_records if show_all_points else scope_records
     if not scope_records:
-        st.info("연결선을 표시할 데이터가 없습니다.")
-        return
+        st.caption("선택 범위에서 연결선을 만들 수 없어 '전체'로 확장합니다.")
+        scope_records = filtered_records
+
+    point_records = filtered_records if show_all_points else scope_records
 
     # 포인트는 point_records, 선은 scope_records 기준으로 계산
     _, sub_pts, mtr_pts, dl_pts, _, _ = _build_schematic_points_and_segments(
@@ -746,7 +857,7 @@ def render_capacity_connection_map(
     col_map, col_info = st.columns([0.73, 0.27], gap="large")
 
     with col_map:
-        plot_state = st.plotly_chart(
+        st.plotly_chart(
             fig,
             use_container_width=True,
             config={"scrollZoom": True, "displayModeBar": False},
@@ -754,28 +865,6 @@ def render_capacity_connection_map(
             on_select="rerun",
             selection_mode="points",
         )
-
-    # 클릭(포인트 선택) 이벤트 처리: DL 점의 customdata(point_key)를 읽어 selectbox 값을 갱신
-    clicked_key: str | None = None
-    if hasattr(plot_state, "get"):
-        sel = plot_state.get("selection")
-        if isinstance(sel, dict):
-            pts = sel.get("points")
-            if isinstance(pts, list) and pts:
-                for p in reversed(pts):
-                    if not isinstance(p, dict):
-                        continue
-                    cd = p.get("customdata")
-                    if isinstance(cd, str):
-                        clicked_key = cd
-                        break
-                    if isinstance(cd, (list, tuple)) and cd and isinstance(cd[0], str):
-                        clicked_key = cd[0]
-                        break
-
-    if clicked_key and clicked_key in key_to_record and clicked_key != str(selected_key):
-        st.session_state["map_selected_dl_key"] = clicked_key
-        st.rerun()
 
     with col_info:
         st.subheader("선택 선로 상세")
