@@ -278,7 +278,18 @@ def _fetch_online_with_cache(
 def _render_query_sidebar() -> tuple[list[CapacityRecord] | None, str]:
     """사이드바에서 실시간 조회 또는 파일 업로드를 처리하고 (records, label)을 반환."""
     st.sidebar.header("⚡ 실시간 조회")
-    region: RegionInfo | None = render_region_selector()
+
+    last_records = st.session_state.get("last_records")
+    last_label = st.session_state.get("last_data_label")
+
+    try:
+        region: RegionInfo | None = render_region_selector()
+    except Exception as exc:
+        logger.warning("지역 선택 UI 오류: %s", exc, exc_info=True)
+        if isinstance(last_records, list):
+            st.sidebar.warning("지역 선택 UI 오류로 이전 조회 결과를 표시합니다.")
+            return last_records, str(last_label or "이전 조회 결과")
+        raise
 
     jibun = st.sidebar.text_input(
         "지번(선택)",
@@ -351,8 +362,6 @@ def _render_query_sidebar() -> tuple[list[CapacityRecord] | None, str]:
         return None, ""
 
     if not run:
-        last_records = st.session_state.get("last_records")
-        last_label = st.session_state.get("last_data_label")
         if isinstance(last_records, list):
             st.sidebar.caption("이전 조회 결과를 표시합니다. 새 조회는 '조회' 버튼을 누르세요.")
             return last_records, str(last_label or "이전 조회 결과")
@@ -360,6 +369,8 @@ def _render_query_sidebar() -> tuple[list[CapacityRecord] | None, str]:
 
     if region is None:
         st.sidebar.warning("지역을 먼저 선택하세요.")
+        if isinstance(last_records, list):
+            return last_records, str(last_label or "이전 조회 결과")
         return None, ""
 
     # API 키가 없으면 한전ON(EWM092D00) 브라우저 스크래퍼로 폴백
@@ -376,6 +387,8 @@ def _render_query_sidebar() -> tuple[list[CapacityRecord] | None, str]:
                 "⚠️ KEPCO_API_KEY 미설정 상태에서는 읍/면/동 '전체' 조회를 지원하지 않습니다. "
                 "읍/면/동을 선택하거나 API 키를 설정해주세요."
             )
+            if isinstance(last_records, list):
+                return last_records, str(last_label or "이전 조회 결과")
             return None, ""
         st.sidebar.warning("⚠️ KEPCO_API_KEY 미설정 → 한전ON 브라우저 조회 모드")
 
@@ -542,6 +555,14 @@ def main() -> None:
     _render_refresh_timer()
 
     records, data_label = _render_query_sidebar()
+
+    # 어떤 이유로든 sidebar가 records=None을 반환해도, 마지막 결과가 있으면 유지한다.
+    if records is None:
+        last_records = st.session_state.get("last_records")
+        last_label = st.session_state.get("last_data_label")
+        if isinstance(last_records, list):
+            records = last_records
+            data_label = str(last_label or "이전 조회 결과")
 
     if records is None:
         st.info("👈 사이드바에서 지역을 선택하고 '조회'를 누르세요.")
