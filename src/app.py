@@ -324,18 +324,38 @@ def _render_query_sidebar() -> tuple[list[CapacityRecord] | None, str]:
 
     if uploaded_file is not None:
         file_bytes = uploaded_file.read()
+        file_id = f"{uploaded_file.name}:{len(file_bytes)}"
+        cached_id = st.session_state.get("_uploaded_file_id")
+        cached_records = st.session_state.get("_uploaded_records")
+        if cached_id == file_id and isinstance(cached_records, list):
+            st.session_state["last_records"] = cached_records
+            st.session_state["last_data_label"] = "업로드 데이터"
+            return cached_records, "업로드 데이터"
+
         records = load_records_from_uploaded_file(file_bytes, uploaded_file.name)
         if records:
+            action_id = _now_ts()
+            st.session_state["_last_results_action_id"] = float(action_id)
+            st.session_state["_uploaded_file_id"] = file_id
+            st.session_state["_uploaded_records"] = records
             st.session_state["_last_query_meta"] = {
                 "mode": "upload",
                 "filename": uploaded_file.name,
                 "cached": False,
+                "action_id": float(action_id),
             }
+            st.session_state["last_records"] = records
+            st.session_state["last_data_label"] = "업로드 데이터"
             return records, "업로드 데이터"
         st.sidebar.error("파일에서 유효한 데이터를 찾을 수 없습니다.")
         return None, ""
 
     if not run:
+        last_records = st.session_state.get("last_records")
+        last_label = st.session_state.get("last_data_label")
+        if isinstance(last_records, list):
+            st.sidebar.caption("이전 조회 결과를 표시합니다. 새 조회는 '조회' 버튼을 누르세요.")
+            return last_records, str(last_label or "이전 조회 결과")
         return None, ""
 
     if region is None:
@@ -366,7 +386,16 @@ def _render_query_sidebar() -> tuple[list[CapacityRecord] | None, str]:
             )
             st.sidebar.info(msg)
         browser_min_interval_seconds = float(effective_browser_minutes) * 60.0
-        return _fetch_online_with_cache(region, jibun, browser_min_interval_seconds)
+        recs, label = _fetch_online_with_cache(region, jibun, browser_min_interval_seconds)
+        if recs is not None:
+            action_id = _now_ts()
+            st.session_state["_last_results_action_id"] = float(action_id)
+            meta = st.session_state.get("_last_query_meta")
+            if isinstance(meta, dict):
+                st.session_state["_last_query_meta"] = {**meta, "action_id": float(action_id)}
+            st.session_state["last_records"] = recs
+            st.session_state["last_data_label"] = str(label or region.display_name)
+        return recs, label
 
     if region.dong == "전체":
         st.sidebar.info(
@@ -418,6 +447,13 @@ def _render_query_sidebar() -> tuple[list[CapacityRecord] | None, str]:
                     },
                     "cached": True,
                 }
+                action_id = _now_ts()
+                st.session_state["_last_results_action_id"] = float(action_id)
+                meta = st.session_state.get("_last_query_meta")
+                if isinstance(meta, dict):
+                    st.session_state["_last_query_meta"] = {**meta, "action_id": float(action_id)}
+                st.session_state["last_records"] = recs
+                st.session_state["last_data_label"] = str(label or region.display_name)
                 return recs, str(label or region.display_name)
 
         with st.spinner(f"{region.display_name} 여유용량 조회 중..."):
@@ -434,6 +470,8 @@ def _render_query_sidebar() -> tuple[list[CapacityRecord] | None, str]:
             "label": region.display_name,
             "auto_reload": auto_reload,
         }
+        action_id = _now_ts()
+        st.session_state["_last_results_action_id"] = float(action_id)
         st.session_state["_last_query_meta"] = {
             "mode": "api",
             "region": region.model_dump(),
@@ -447,10 +485,17 @@ def _render_query_sidebar() -> tuple[list[CapacityRecord] | None, str]:
                 "returnType": "json",
             },
             "cached": False,
+            "action_id": float(action_id),
         }
+        st.session_state["last_records"] = records
+        st.session_state["last_data_label"] = region.display_name
         return records, region.display_name
     except KepcoNoDataError:
         st.sidebar.warning("조회 결과가 없습니다. 읍/면/동 또는 지번을 변경해 다시 시도해보세요.")
+        action_id = _now_ts()
+        st.session_state["_last_results_action_id"] = float(action_id)
+        st.session_state["last_records"] = []
+        st.session_state["last_data_label"] = region.display_name
         return [], region.display_name
     except KepcoAPIError as exc:
         st.sidebar.error(f"한전 API 오류: {exc.message}")
@@ -469,7 +514,13 @@ def _render_query_sidebar() -> tuple[list[CapacityRecord] | None, str]:
                     "label": str(cached_item.get("label") or region.display_name),
                     "auto_reload": auto_reload,
                 }
-            return cached_item["records"], str(cached_item.get("label") or region.display_name)
+            recs = cached_item["records"]
+            label = str(cached_item.get("label") or region.display_name)
+            action_id = _now_ts()
+            st.session_state["_last_results_action_id"] = float(action_id)
+            st.session_state["last_records"] = recs
+            st.session_state["last_data_label"] = label
+            return recs, label
         return None, ""
     except Exception:
         logger.exception("실시간 조회 실패")
@@ -506,22 +557,27 @@ def main() -> None:
             )
         return
 
+    # 버튼/위젯 조작으로 rerun 되어도 마지막 결과가 유지되도록 저장
+    st.session_state["last_records"] = records
+    st.session_state["last_data_label"] = data_label
+
     if not records:
         st.warning(f"'{data_label or '선택한 지역'}' 조회 결과가 없습니다.")
         return
 
     st.subheader(f"📊 분석 결과 ({len(records)}건) · {data_label}")
 
-    # 결과를 session_state에 저장
-    st.session_state["last_records"] = records
-
-    # 조회 이력 구성/저장 (지도 탭에서 즉시 보이도록 탭 렌더링 전에 수행)
-    try:
-        meta = st.session_state.get("_last_query_meta")
-        history_record = _build_history_record(records, data_label=data_label, meta=meta)
-        _save_history_once(history_record)
-    except Exception:
-        logger.warning("조회 이력 구성/저장 실패", exc_info=True)
+    # 조회 이력은 '새 조회/업로드' 액션에서 1번만 저장
+    action_id = st.session_state.get("_last_results_action_id")
+    last_saved_action_id = st.session_state.get("_last_saved_action_id")
+    if isinstance(action_id, (int, float)) and action_id != last_saved_action_id:
+        try:
+            meta = st.session_state.get("_last_query_meta")
+            history_record = _build_history_record(records, data_label=data_label, meta=meta)
+            _save_history_once(history_record)
+            st.session_state["_last_saved_action_id"] = float(action_id)
+        except Exception:
+            logger.warning("조회 이력 구성/저장 실패", exc_info=True)
 
     render_result_table(records)
 
