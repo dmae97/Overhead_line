@@ -71,13 +71,20 @@ def render_hierarchy_sankey(records: list[CapacityRecord]) -> None:
         dl_keys_all[key] = min(dl_keys_all.get(key, 10**12), int(r.min_capacity))
 
     dl_total = len(dl_keys_all)
-    max_dl_default = 60 if dl_total > 60 else max(10, dl_total)
+
+    # Streamlit slider는 step 정합성(값/범위) 문제로 예외가 날 수 있어,
+    # 작은 범위에서도 항상 안전하게 동작하도록 step=1로 둔다.
+    slider_min = 10
+    slider_max = max(slider_min, min(300, dl_total or slider_min))
+    max_dl_default = 60 if dl_total > 60 else max(slider_min, dl_total)
+    max_dl_default = max(slider_min, min(slider_max, int(max_dl_default)))
+
     max_dl = st.slider(
         "DL 표시 상한",
-        min_value=10,
-        max_value=max(10, min(300, dl_total or 10)),
-        value=max_dl_default,
-        step=10,
+        min_value=int(slider_min),
+        max_value=int(slider_max),
+        value=int(max_dl_default),
+        step=1,
         help="DL이 많으면 선이 겹쳐 시인성이 떨어집니다.",
     )
     sort_mode = st.radio(
