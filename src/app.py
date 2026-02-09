@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import time
 from datetime import datetime
+from typing import Any
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -114,6 +115,72 @@ def _render_refresh_timer() -> None:
 
 def _make_cache_key(mode: str, region: RegionInfo, jibun: str) -> str:
     return f"{mode}:{region.display_name}:{jibun.strip()}"
+
+
+def _build_history_record(
+    records: list[CapacityRecord],
+    data_label: str,
+    meta: object,
+) -> QueryHistoryRecord:
+    """현재 조회 결과로 QueryHistoryRecord를 구성한다."""
+    meta_dict: dict[str, Any] = meta if isinstance(meta, dict) else {}
+    raw_region = meta_dict.get("region")
+    region_dict: dict[str, Any] = raw_region if isinstance(raw_region, dict) else {}
+    raw_params = meta_dict.get("params")
+    params_dict: dict[str, Any] = raw_params if isinstance(raw_params, dict) else {}
+
+    min_caps = [r.min_capacity for r in records]
+    min_caps_sorted = sorted(min_caps)
+    min_cap_min = int(min_caps_sorted[0]) if min_caps_sorted else 0
+    min_cap_max = int(min_caps_sorted[-1]) if min_caps_sorted else 0
+    mid = len(min_caps_sorted) // 2
+    min_cap_median = int(min_caps_sorted[mid]) if min_caps_sorted else 0
+    connectable_count = sum(1 for r in records if r.is_connectable)
+    not_connectable_count = len(records) - connectable_count
+
+    return QueryHistoryRecord(
+        region_name=data_label,
+        metro_cd=str(params_dict.get("metroCd") or ""),
+        city_cd=str(params_dict.get("cityCd") or ""),
+        dong=str(params_dict.get("addrLidong") or ""),
+        sido=str(region_dict.get("sido") or ""),
+        sigungu=str(region_dict.get("sigungu") or ""),
+        mode=str(meta_dict.get("mode") or ""),
+        jibun=str(meta_dict.get("jibun") or ""),
+        result_count=len(records),
+        connectable_count=int(connectable_count),
+        not_connectable_count=int(not_connectable_count),
+        min_cap_min=int(min_cap_min),
+        min_cap_median=int(min_cap_median),
+        min_cap_max=int(min_cap_max),
+        queried_at=datetime.now(),
+    )
+
+
+def _save_history_once(record: QueryHistoryRecord) -> None:
+    """Streamlit rerun 중복 저장을 막고, 가능하면 DB에 저장한다."""
+    ts_key = record.queried_at.strftime("%Y%m%d%H%M%S")
+    save_key = f"{record.region_name}:{record.result_count}:{record.mode}:{ts_key}"
+
+    # 같은 rerun에서 중복 저장 방지
+    if st.session_state.get("_last_saved_history_key") == save_key:
+        return
+    st.session_state["_last_saved_history_key"] = save_key
+
+    # 세션 폴백 저장소(지도 표시용)
+    session_rows = st.session_state.get("_session_history_rows")
+    if not isinstance(session_rows, list):
+        session_rows = []
+        st.session_state["_session_history_rows"] = session_rows
+    session_rows.append(record.model_dump())
+    st.session_state["_current_history_record"] = record.model_dump()
+
+    # DB 저장은 실패해도 앱 동작은 유지
+    try:
+        repo = HistoryRepository()
+        repo.save(record)
+    except Exception:
+        logger.warning("조회 이력 저장 실패", exc_info=True)
 
 
 def _fetch_online_with_cache(
@@ -447,6 +514,14 @@ def main() -> None:
     # 결과를 session_state에 저장
     st.session_state["last_records"] = records
 
+    # 조회 이력 구성/저장 (지도 탭에서 즉시 보이도록 탭 렌더링 전에 수행)
+    try:
+        meta = st.session_state.get("_last_query_meta")
+        history_record = _build_history_record(records, data_label=data_label, meta=meta)
+        _save_history_once(history_record)
+    except Exception:
+        logger.warning("조회 이력 구성/저장 실패", exc_info=True)
+
     render_result_table(records)
 
     st.divider()
@@ -470,11 +545,34 @@ def main() -> None:
     with tab4:
         render_hierarchy_sankey(records)
     with tab5:
+        rows: list[QueryHistoryRecord] = []
+        db_error: str | None = None
         try:
             repo = HistoryRepository()
             rows = repo.list_recent(limit=200)
-        except Exception:
-            rows = []
+        except Exception as exc:
+            db_error = str(exc)
+
+        # DB가 비어있거나(첫 조회/재배포 직후), 저장 실패해도 현재/세션 데이터로 지도 표시
+        if not rows:
+            session_rows = st.session_state.get("_session_history_rows")
+            if isinstance(session_rows, list) and session_rows:
+                try:
+                    rows = [QueryHistoryRecord.model_validate(x) for x in session_rows[-200:]]
+                except Exception:
+                    rows = []
+
+        if not rows:
+            current = st.session_state.get("_current_history_record")
+            if isinstance(current, dict):
+                try:
+                    rows = [QueryHistoryRecord.model_validate(current)]
+                except Exception:
+                    rows = []
+
+        if db_error and not rows:
+            st.warning(f"조회 이력 DB 접근 실패: {db_error}")
+
         render_korea_query_map(rows)
     with tab6:
         meta = st.session_state.get("_last_query_meta")
@@ -485,57 +583,7 @@ def main() -> None:
 
     st.divider()
 
-    # 조회 이력 저장 (Streamlit rerun 중복 저장 방지)
-    try:
-        meta = st.session_state.get("_last_query_meta")
-        timer_state = st.session_state.get("_timer_state")
-        last_ts = ""
-        if isinstance(timer_state, dict) and timer_state.get("last_ts") is not None:
-            last_ts = str(timer_state.get("last_ts"))
-        save_key = f"{data_label}:{len(records)}:{last_ts}"
-
-        if st.session_state.get("_last_saved_history_key") != save_key:
-            st.session_state["_last_saved_history_key"] = save_key
-            meta_dict = meta if isinstance(meta, dict) else {}
-            region_dict = (
-                meta_dict.get("region") if isinstance(meta_dict.get("region"), dict) else {}
-            )
-
-            min_caps = [r.min_capacity for r in records]
-            min_caps_sorted = sorted(min_caps)
-            min_cap_min = int(min_caps_sorted[0]) if min_caps_sorted else 0
-            min_cap_max = int(min_caps_sorted[-1]) if min_caps_sorted else 0
-            mid = len(min_caps_sorted) // 2
-            min_cap_median = int(min_caps_sorted[mid]) if min_caps_sorted else 0
-            connectable_count = sum(1 for r in records if r.is_connectable)
-            not_connectable_count = len(records) - connectable_count
-
-            repo = HistoryRepository()
-            params_dict = (
-                meta_dict.get("params") if isinstance(meta_dict.get("params"), dict) else {}
-            )
-
-            repo.save(
-                QueryHistoryRecord(
-                    region_name=data_label,
-                    metro_cd=str(params_dict.get("metroCd") or ""),
-                    city_cd=str(params_dict.get("cityCd") or ""),
-                    dong=str(params_dict.get("addrLidong") or ""),
-                    sido=str(region_dict.get("sido") or ""),
-                    sigungu=str(region_dict.get("sigungu") or ""),
-                    mode=str(meta_dict.get("mode") or ""),
-                    jibun=str(meta_dict.get("jibun") or ""),
-                    result_count=len(records),
-                    connectable_count=int(connectable_count),
-                    not_connectable_count=int(not_connectable_count),
-                    min_cap_min=int(min_cap_min),
-                    min_cap_median=int(min_cap_median),
-                    min_cap_max=int(min_cap_max),
-                    queried_at=datetime.now(),
-                )
-            )
-    except Exception:
-        logger.warning("조회 이력 저장 실패", exc_info=True)
+    # (이력 저장은 탭 렌더링 이전에 수행)
 
     render_history_panel()
 
